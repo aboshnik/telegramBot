@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.local
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+prisma/dev.db
+prisma/meta.db
+.prisma/
+npm-debug.log
+yarn-error.log
+pnpm-lock.yaml
+package-lock.json
+

@@ -1,0 +1,75 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DB_URL")
+}
+
+model EmployeeRef {
+  id         Int      @id @default(autoincrement())
+  fullName   String
+  position   String
+  department String
+  telegramId BigInt?  @unique
+  telegramUsername String?
+  active     Boolean  @default(true)
+  users      User[]
+
+  @@index([fullName, position, department])
+  @@unique([fullName, position, department])
+}
+
+model User {
+  id             Int           @id @default(autoincrement())
+  telegramId     BigInt        @unique
+  telegramUsername String?
+  empId          Int?
+  fullName       String
+  position       String
+  department     String
+  createdAt      DateTime      @default(now())
+  lastVerifiedAt DateTime?
+  employee       EmployeeRef?  @relation(fields: [empId], references: [id])
+  inviteLinks    InviteLink[]
+}
+
+model InviteLink {
+  id           Int           @id @default(autoincrement())
+  telegramId   BigInt
+  url          String        @unique
+  inviteLinkId String?
+  channelId    String        @default("")
+  expiresAt    DateTime
+  ttlSeconds   Int
+  status       String        @default("ACTIVE")
+  createdAt    DateTime      @default(now())
+  usedAt       DateTime?
+  user         User          @relation(fields: [telegramId], references: [telegramId])
+
+  @@index([telegramId, status, expiresAt])
+}
+
+model DepartmentChannel {
+  id         Int    @id @default(autoincrement())
+  department String @unique
+  channelId  String
+}
+
+model AuditLog {
+  id          Int      @id @default(autoincrement())
+  telegramId  BigInt
+  action      String
+  payloadJson String
+  createdAt   DateTime @default(now())
+
+  @@index([telegramId, action])
+}
+
+model Admin {
+  id          Int      @id @default(autoincrement())
+  telegramId  BigInt   @unique
+  createdAt   DateTime @default(now())
+}
+

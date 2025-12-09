@@ -1,0 +1,26 @@
+{
+  "name": "telegram-bot",
+  "version": "0.1.0",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "NODE_ENV=development node src/index.js",
+    "prisma:generate": "prisma generate",
+    "prisma:generate:meta": "prisma generate --schema prisma/meta.prisma",
+    "prisma:migrate": "prisma migrate dev --name init",
+    "prisma:push": "prisma db push",
+    "prisma:push:meta": "prisma db push --schema prisma/meta.prisma",
+    "seed": "node src/seed.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.20.0",
+    "date-fns": "^3.6.0",
+    "dotenv": "^16.4.5",
+    "telegraf": "^4.15.3"
+  },
+  "devDependencies": {
+    "prisma": "^5.20.0"
+  }
+}
+

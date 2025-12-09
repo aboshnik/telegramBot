@@ -1,0 +1,42 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/@prisma/client-meta"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("META_DB_URL")
+}
+
+model DepartmentChannel {
+  id         Int    @id @default(autoincrement())
+  department String @unique
+  channelId  String
+}
+
+model Admin {
+  id          Int      @id @default(autoincrement())
+  telegramId  BigInt   @unique
+  telegramUsername String?
+  createdAt   DateTime @default(now())
+}
+
+model AdminLog {
+  id               Int      @id @default(autoincrement())
+  action           String
+  actorTelegramId  BigInt
+  actorUsername    String?
+  targetTelegramId BigInt?
+  targetUsername   String?
+  department       String?
+  channelId        String?
+  channelName      String?
+  reason           String?
+  createdAt        DateTime @default(now())
+}
+
+model AdminSettings {
+  id            Int     @id @default(autoincrement())
+  adminLogChatId String?
+}
+
