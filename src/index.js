@@ -1,6 +1,8 @@
 import { createBot } from "./bot.js";
 import { disconnectDb } from "./db.js";
 import { disconnectMetaDb } from "./dbMeta.js";
+// Keep-alive для Replit (опционально, раскомментируй если деплоишь на Replit)
+// import "../keep-alive.js";
 
 const bot = createBot();
 

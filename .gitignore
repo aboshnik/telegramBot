@@ -7,9 +7,12 @@ node_modules/
 *.sqlite3
 prisma/dev.db
 prisma/meta.db
+data/
 .prisma/
 npm-debug.log
 yarn-error.log
 pnpm-lock.yaml
 package-lock.json
+DEPLOY_REPLIT.md
+.vs/
 
