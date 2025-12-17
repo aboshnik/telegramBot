@@ -2,12 +2,6 @@ import { createBot } from "./bot.js";
 import { disconnectDb } from "./db.js";
 import { disconnectMetaDb } from "./dbMeta.js";
 
-// Keep-alive HTTP сервер: нужен, чтобы Replit показывал Webview URL и чтобы его мог пинговать UptimeRobot.
-// Без него Replit пишет "no webpage to preview".
-import("../keep-alive.js").catch((e) => {
-  console.error("Failed to start keep-alive server:", e);
-});
-
 const bot = createBot();
 
 // Логи ошибок, чтобы процесс не "падал молча"
