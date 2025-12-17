@@ -2,14 +2,11 @@ import { createBot } from "./bot.js";
 import { disconnectDb } from "./db.js";
 import { disconnectMetaDb } from "./dbMeta.js";
 
-// На Replit бесплатные repl'ы часто "засыпают". Keep-alive нужен, чтобы внешний мониторинг
-// (например, UptimeRobot) мог пинговать HTTP-эндпоинт и не давать repl'у уйти в сон.
-// Вне Replit этот сервер не обязателен.
-if (process.env.REPL_ID || process.env.REPL_SLUG || process.env.REPL_OWNER) {
-  import("../keep-alive.js").catch((e) => {
-    console.error("Failed to start keep-alive server:", e);
-  });
-}
+// Keep-alive HTTP сервер: нужен, чтобы Replit показывал Webview URL и чтобы его мог пинговать UptimeRobot.
+// Без него Replit пишет "no webpage to preview".
+import("../keep-alive.js").catch((e) => {
+  console.error("Failed to start keep-alive server:", e);
+});
 
 const bot = createBot();
 
