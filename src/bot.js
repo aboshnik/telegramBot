@@ -1,4 +1,4 @@
-import { Telegraf } from "telegraf";
+import { Telegraf, Markup } from "telegraf";
 import { formatISO9075 } from "date-fns";
 import { config } from "./config.js";
 import { prisma } from "./db.js";
@@ -9,6 +9,26 @@ import { getOrCreateInviteLink } from "./services/inviteService.js";
 const isPrivate = (ctx) => ctx.chat?.type === "private";
 const isOwner = (ctx) =>
   ctx.from && config.ownerId && String(ctx.from.id) === String(config.ownerId);
+
+// Хранилище состояний пользователей для поэтапного заполнения
+const userStates = new Map(); // telegramId -> { step, data: { fullName, phoneNumber, position, department } }
+
+// Регулярное выражение для валидации номера телефона (разрешаем +7, цифры и разделители)
+const phoneRegex = /^\+?[\d\s\-\(\)]+$/;
+
+// Нормализация телефона: оставляем только цифры, если начинается с 7 (11 цифр) - убираем первую 7
+const normalizePhone = (text) => {
+  const digits = text.replace(/\D/g, "");
+  // Если номер начинается с 7 (11 цифр), убираем первую 7, оставляем 10 цифр
+  if (digits.length === 11 && digits.startsWith("7")) {
+    return digits.slice(1);
+  }
+  return digits;
+};
+
+// Временные сессии подтверждения при попытке входа с чужим Telegram
+const pendingSessions = new Map(); // sessionId -> { requesterId, form, expiresAt }
+const createSessionId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
 async function hasAdminAccess(ctx) {
   if (isOwner(ctx)) return true;
@@ -24,18 +44,44 @@ export function createBot() {
 
   bot.start(async (ctx) => {
     if (!isPrivate(ctx)) return;
+    
+    const telegramId = ctx.from?.id;
+    if (!telegramId) {
+      await ctx.reply("Не удалось получить твой Telegram ID.");
+      return;
+    }
+
+    // Сбрасываем состояние и начинаем заново
+    userStates.set(telegramId, {
+      step: "waiting_fio",
+      data: {}
+    });
+
     await ctx.reply(
-      "Ввведи следующие данные: ФИО, должность, отдел.\n" +
-        "Пример: Иванов Иван Иванович Менеджер Отдел разработки\n" +
-        "Можно через разделитель | : Иванов Иван Иванович | Менеджер | Отдел разработки"
+      "Добро пожаловать! Введите следующие данные, соблюдая этапы:\n\n" +
+      "1. ФИО"
     );
   });
 
   bot.command("reset", async (ctx) => {
     if (!isPrivate(ctx)) return;
+    
+    const telegramId = ctx.from?.id;
+    if (telegramId) {
+      userStates.delete(telegramId);
+    }
+    
     await ctx.reply(
-      "Отправь в одном сообщении: ФИО должность отдел (можно через | )."
+      "Начинаем заново. Введите следующие данные, соблюдая этапы:\n\n" +
+      "1. ФИО"
     );
+    
+    if (telegramId) {
+      userStates.set(telegramId, {
+        step: "waiting_fio",
+        data: {}
+      });
+    }
   });
 
   bot.command("bind_department", async (ctx) => {
@@ -215,30 +261,29 @@ export function createBot() {
       return;
     }
 
-    let channelId;
-    try {
-      channelId = await resolveChannelId(user.department);
+    // Проверяем статус "уволен" из БД через связь с EmployeeRef
+    let employmentStatus = "активен";
+    if (user.empId) {
+      try {
+        const employee = await prisma.employeeRef.findUnique({
+          where: { id: user.empId },
+          select: { fired: true, blacklisted: true },
+        });
+        if (employee) {
+          if (employee.fired) {
+            employmentStatus = "уволен";
+          } else if (employee.blacklisted) {
+            employmentStatus = "в чёрном списке";
+          }
+        }
     } catch (err) {
-      console.error(err);
-      await ctx.reply("Не найден канал для отдела пользователя.");
-      return;
+        console.error("Failed to check employee status", err);
+      }
     }
 
-    try {
-      const member = await ctx.telegram.getChatMember(
-        channelId,
-        Number(user.telegramId)
-      );
-      const status = member?.status || "unknown";
       await ctx.reply(
-        `Пользователь: ${user.fullName}\nID: ${user.telegramId}\nДолжность: ${user.position}\nОтдел: ${user.department}\nСтатус в канале: ${status}`
+      `Пользователь: ${user.fullName}\nID: ${user.telegramId}\nДолжность: ${user.position}\nОтдел: ${user.department}\nСтатус: ${employmentStatus}`
       );
-    } catch (err) {
-      console.error(err);
-      await ctx.reply(
-        `Не удалось проверить статус: ${err.response?.description || err.message}`
-      );
-    }
   });
 
   bot.command("check_hist", async (ctx) => {
@@ -284,6 +329,10 @@ export function createBot() {
     await ctx.reply(chunk);
   });
 
+  bot.command("news", async (ctx) => {
+    await handleNewsCommand(ctx);
+  });
+
   bot.command("set_admin_log_chat", async (ctx) => {
     if (!isOwner(ctx)) {
       await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
@@ -303,6 +352,209 @@ export function createBot() {
 
     adminLogChatIdCache = String(chatId);
     await ctx.reply(`Admin log chat установлен: ${chatId}`);
+  });
+
+  // Обработка /news с фото в подписи
+  bot.on("photo", async (ctx) => {
+    const caption = ctx.message?.caption || "";
+    if (!/^\/news(@\w+)?\b/i.test(caption)) return;
+    await handleNewsCommand(ctx);
+  });
+
+  // Подтверждение/блокировка сессии при попытке входа под чужим Telegram
+  bot.action(/^session_(allow|block)_(.+)$/, async (ctx) => {
+    const action = ctx.match[1]; // allow | block
+    const sessionId = ctx.match[2];
+    const session = pendingSessions.get(sessionId);
+
+    if (!session) {
+      await ctx.answerCbQuery("Сессия не найдена или истекла.");
+      return;
+    }
+
+    // Проверка истечения
+    if (session.expiresAt && Date.now() > session.expiresAt) {
+      pendingSessions.delete(sessionId);
+      await ctx.answerCbQuery("Сессия истекла.");
+      return;
+    }
+
+    pendingSessions.delete(sessionId);
+
+    if (action === "block") {
+      await ctx.answerCbQuery("Сессию заблокировали.");
+      try {
+        await ctx.telegram.sendMessage(
+          Number(session.requesterId),
+          "Произошла ошибка."
+        );
+      } catch (err) {
+        console.error("Failed to notify requester (block)", err);
+      }
+      return;
+    }
+
+    // allow
+    await ctx.answerCbQuery("Доступ разрешён. Попросите повторить попытку.");
+    try {
+      await ctx.telegram.sendMessage(
+        Number(session.requesterId),
+        "Доступ подтверждён. Отправь /start ещё раз, чтобы продолжить."
+      );
+    } catch (err) {
+      console.error("Failed to notify requester (allow)", err);
+    }
+  });
+
+  bot.command("set_news_channel", async (ctx) => {
+    const chatType = ctx.chat?.type;
+    const isChannelContext = chatType === "channel" || chatType === "supergroup";
+
+    // В личке ограничиваем только владельцем, в канале разрешаем без проверки (у бота и так должны быть права админа)
+    if (!isChannelContext && !isOwner(ctx)) {
+      await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
+      return;
+    }
+
+    let targetChannelId;
+
+    if (isChannelContext) {
+      // Если команда вызвана прямо в канале — используем его chat.id
+      targetChannelId = ctx.chat?.id;
+    } else {
+      // В личке ждём chat_id/username канала аргументом: /set_news_channel -100..., /set_news_channel @channel
+      const arg = ctx.message?.text?.split(" ").slice(1).join(" ").trim();
+      if (!arg) {
+        await ctx.reply(
+          "Используй команду так:\n" +
+            "1) В самом новостном канале: просто /set_news_channel\n" +
+            "или\n" +
+            "2) В личке с ботом: /set_news_channel -1001234567890 или /set_news_channel @username_канала"
+        );
+        return;
+      }
+      targetChannelId = arg;
+    }
+
+    if (!targetChannelId) {
+      await ctx.reply("Не удалось определить идентификатор канала.");
+      return;
+    }
+
+    await prismaMeta.adminSettings.upsert({
+      where: { id: 1 },
+      update: { newsChannelId: String(targetChannelId) },
+      create: { id: 1, newsChannelId: String(targetChannelId) },
+    });
+
+    newsChannelIdCache = String(targetChannelId);
+    await ctx.reply(`Новостной канал установлен: ${targetChannelId}`);
+  });
+
+  // Временная команда для ручной проверки БД и кика уволенных/в ЧС
+  bot.command("check_fired", async (ctx) => {
+    if (!isOwner(ctx)) {
+      await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
+      return;
+    }
+
+    try {
+      const employees = await prisma.employeeRef.findMany({
+        where: {
+          OR: [{ fired: true }, { blacklisted: true }],
+          telegramId: { not: null },
+        },
+      });
+
+      if (!employees.length) {
+        await ctx.reply("Нет сотрудников со статусом 'уволен' или в чёрном списке.");
+        return;
+      }
+
+      const newsChannelId = await getNewsChannelId();
+      let processed = 0;
+
+      for (const emp of employees) {
+        const tgId = Number(emp.telegramId);
+
+        // Канал отдела
+        try {
+          const channelId = await resolveChannelId(emp.department);
+          await ctx.telegram.banChatMember(channelId, tgId);
+        } catch (err) {
+          console.error("check_fired: failed to ban from department channel", err);
+        }
+
+        // Новостной канал
+        if (newsChannelId) {
+          try {
+            await ctx.telegram.banChatMember(newsChannelId, tgId);
+          } catch (err) {
+            console.error("check_fired: failed to ban from news channel", err);
+          }
+        }
+
+        try {
+          await prisma.employeeRef.update({
+            where: { id: emp.id },
+            data: { blacklisted: true },
+          });
+        } catch (err) {
+          console.error("check_fired: failed to mark blacklisted", err);
+        }
+
+        try {
+          await prisma.auditLog.create({
+            data: {
+              telegramId: BigInt(emp.telegramId),
+              action: "manual_check_block",
+              payloadJson: JSON.stringify({
+                empId: emp.id,
+                fired: emp.fired,
+                blacklisted: emp.blacklisted,
+              }),
+            },
+          });
+        } catch (err) {
+          console.error("check_fired: failed to write audit log", err);
+        }
+
+        processed += 1;
+      }
+
+      await ctx.reply(`Проверка завершена. Обработано сотрудников: ${processed}.`);
+    } catch (err) {
+      console.error("check_fired failed", err);
+      await ctx.reply("Не удалось выполнить проверку. Попробуй позже.");
+    }
+  });
+
+  // Полный сброс привязок: EmployeeRef.telegramId/telegramUsername + очистка таблицы User
+  bot.command("unbind_all", async (ctx) => {
+    if (!isOwner(ctx)) {
+      await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
+      return;
+    }
+
+    try {
+      // Удаляем ссылки, потом пользователей, потом обнуляем привязки сотрудников — чтобы не ловить FK ошибки
+      const linksResult = await prisma.inviteLink.deleteMany({});
+      const userResult = await prisma.user.deleteMany({});
+      const empResult = await prisma.employeeRef.updateMany({
+        data: { telegramId: null, telegramUsername: null },
+      });
+
+      await ctx.reply(
+        [
+          `Удалено invite ссылок: ${linksResult.count}.`,
+          `Удалено записей пользователей (User): ${userResult.count}.`,
+          `Сброшены привязки Telegram ID/username у ${empResult.count} сотрудников.`,
+        ].join("\n")
+      );
+    } catch (err) {
+      console.error(err);
+      await ctx.reply("Не удалось сбросить привязки. Попробуй позже.");
+    }
   });
 
   bot.command("check_hist", async (ctx) => {
@@ -437,30 +689,345 @@ export function createBot() {
     // Игнорируем произвольные сообщения в группах/каналах, кроме админ-команд
     if (!isPrivate(ctx)) return;
 
+    const telegramId = ctx.from?.id;
+    if (!telegramId) {
+      await ctx.reply("Не удалось получить твой Telegram ID.");
+      return;
+    }
+
     const text = ctx.message.text.trim();
+    
+    // Проверяем, есть ли у пользователя активное состояние заполнения
+    const userState = userStates.get(telegramId);
+    
+    if (!userState) {
+      // Если состояния нет, предлагаем начать с /start
+      await ctx.reply("Для начала работы используйте команду /start");
+      return;
+    }
 
     try {
-      const parsed = parseSingleMessage(text);
-      if (!parsed) {
-        await ctx.reply(
-          "Формат: ФИО должность отдел в одном сообщении.\n" +
-            "Пример: Иванов Иван Иванович Менеджер Отдел разработки\n" +
-            "Можно так: ФИО|Должность|Отдел"
-        );
-        return;
-      }
+      // Обрабатываем каждый этап
+      switch (userState.step) {
+        case "waiting_fio":
+          if (!text || text.length < 3) {
+            await ctx.reply("Пожалуйста, введите ФИО (минимум 3 символа).");
+            return;
+          }
+          userState.data.fullName = text;
+          userState.step = "waiting_phone";
+          await ctx.reply("2. Номер телефона");
+          break;
 
-      await handleVerificationAndLink(ctx, parsed);
+        case "waiting_phone":
+          // Валидация: пользователь может ввести номер с +7 или без, в итоге должно быть 10 цифр, начиная с 9
+          if (!phoneRegex.test(text)) {
+            await ctx.reply("Пожалуйста, введите номер телефона в формате +7 900 111-22-33 или 900-111-22-33.");
+            return;
+          }
+          const phoneDigits = normalizePhone(text);
+          if (phoneDigits.length !== 10 || !phoneDigits.startsWith("9")) {
+            await ctx.reply("Пожалуйста, введите корректный номер телефона. Пример: +7 900 111-22-33 или 900-111-22-33.");
+            return;
+          }
+          userState.data.phoneNumber = phoneDigits;
+          userState.step = "waiting_position";
+          await ctx.reply("3. Должность");
+          break;
+
+        case "waiting_position":
+          if (!text || text.length < 2) {
+            await ctx.reply("Пожалуйста, введите должность (минимум 2 символа).");
+            return;
+          }
+          userState.data.position = text;
+          userState.step = "waiting_department";
+          await ctx.reply("4. Отдел");
+          break;
+
+        case "waiting_department":
+          if (!text || text.length < 2) {
+            await ctx.reply("Пожалуйста, введите отдел (минимум 2 символа).");
+            return;
+          }
+          userState.data.department = text;
+          
+          // Все данные собраны, показываем подтверждение
+          await showDataConfirmation(ctx, userState.data);
+          userState.step = "confirming_data";
+          break;
+
+        case "editing_fio":
+          if (!text || text.length < 3) {
+            await ctx.reply("Пожалуйста, введите ФИО (минимум 3 символа).");
+            return;
+          }
+          userState.data.fullName = text;
+          await showDataConfirmation(ctx, userState.data);
+          userState.step = "confirming_data";
+          break;
+
+        case "editing_phone":
+          if (!phoneRegex.test(text)) {
+            await ctx.reply("Пожалуйста, введите номер телефона в формате +7 900 111-22-33 или 900-111-22-33.");
+            return;
+          }
+          const editPhoneDigits = normalizePhone(text);
+          if (editPhoneDigits.length !== 10 || !editPhoneDigits.startsWith("9")) {
+            await ctx.reply("Пожалуйста, введите корректный номер телефона. Пример: +7 900 111-22-33 или 900-111-22-33.");
+            return;
+          }
+          userState.data.phoneNumber = editPhoneDigits;
+          await showDataConfirmation(ctx, userState.data);
+          userState.step = "confirming_data";
+          break;
+
+        case "editing_position":
+          if (!text || text.length < 2) {
+            await ctx.reply("Пожалуйста, введите должность (минимум 2 символа).");
+            return;
+          }
+          userState.data.position = text;
+          await showDataConfirmation(ctx, userState.data);
+          userState.step = "confirming_data";
+          break;
+
+        case "editing_department":
+          if (!text || text.length < 2) {
+            await ctx.reply("Пожалуйста, введите отдел (минимум 2 символа).");
+            return;
+          }
+          userState.data.department = text;
+          await showDataConfirmation(ctx, userState.data);
+          userState.step = "confirming_data";
+          break;
+
+        case "confirming_data":
+          // В состоянии подтверждения ожидаем только нажатия кнопок
+          await ctx.reply("Пожалуйста, используйте кнопки для подтверждения или изменения данных.");
+          break;
+
+        default:
+          await ctx.reply("Произошла ошибка. Используйте /start для начала.");
+          userStates.delete(telegramId);
+      }
     } catch (err) {
       console.error(err);
       await ctx.reply("Произошла ошибка. Попробуй ещё раз или позже.");
+      userStates.delete(telegramId);
+    }
+  });
+
+  // Обработчик callback-кнопок для подтверждения и изменения
+  bot.action("confirm", async (ctx) => {
+    if (!isPrivate(ctx)) return;
+    
+    const telegramId = ctx.from?.id;
+    if (!telegramId) return;
+
+    const userState = userStates.get(telegramId);
+    if (!userState) {
+      await ctx.answerCbQuery("Сессия истекла. Используйте /start для начала.");
+      return;
+    }
+
+    try {
+      await ctx.answerCbQuery("Проверяю данные...");
+      await handleVerificationAndLink(ctx, userState.data);
+      userStates.delete(telegramId);
+    } catch (err) {
+      console.error(err);
+      await ctx.answerCbQuery("Произошла ошибка. Попробуйте позже.");
+    }
+  });
+
+  bot.action("edit", async (ctx) => {
+    if (!isPrivate(ctx)) return;
+    
+    const telegramId = ctx.from?.id;
+    if (!telegramId) return;
+
+    const userState = userStates.get(telegramId);
+    if (!userState) {
+      await ctx.answerCbQuery("Сессия истекла. Используйте /start для начала.");
+      return;
+    }
+
+    try {
+      await ctx.answerCbQuery();
+      await showEditMenu(ctx);
+    } catch (err) {
+      console.error(err);
+      await ctx.answerCbQuery("Произошла ошибка. Попробуйте позже.");
+    }
+  });
+
+  // Обработчик для выбора конкретного поля для изменения
+  bot.action(/^change_(fio|phone|position|department)$/, async (ctx) => {
+    if (!isPrivate(ctx)) return;
+    
+    const telegramId = ctx.from?.id;
+    if (!telegramId) return;
+
+    const userState = userStates.get(telegramId);
+    if (!userState) {
+      await ctx.answerCbQuery("Сессия истекла. Используйте /start для начала.");
+      return;
+    }
+
+    try {
+      const field = ctx.match[1];
+      await ctx.answerCbQuery();
+      await handleFieldChange(ctx, field, userState);
+    } catch (err) {
+      console.error(err);
+      await ctx.answerCbQuery("Произошла ошибка. Попробуйте позже.");
     }
   });
 
   return bot;
 }
 
+// Функция для показа данных с кнопками подтверждения
+async function showDataConfirmation(ctx, data) {
+  // Форматируем номер телефона с +7 для отображения
+  const formattedPhone = data.phoneNumber 
+    ? `+7 ${data.phoneNumber.slice(0, 3)} ${data.phoneNumber.slice(3, 6)}-${data.phoneNumber.slice(6, 8)}-${data.phoneNumber.slice(8)}`
+    : "не указано";
+  
+  const dataText = 
+    "Проверь данные:\n\n" +
+    `👤 ФИО: ${data.fullName || "не указано"}\n` +
+    `📞 Телефон: ${formattedPhone}\n` +
+    `💼 Должность: ${data.position || "не указано"}\n` +
+    `🏢 Отдел: ${data.department || "не указано"}`;
+
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback("✅ Подтвердить", "confirm")],
+    [Markup.button.callback("✏️ Изменить", "edit")]
+  ]);
+
+  await ctx.reply(dataText, keyboard);
+}
+
+// Функция для показа меню выбора поля для изменения
+async function showEditMenu(ctx) {
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback("👤 ФИО", "change_fio"),
+      Markup.button.callback("📞 Телефон", "change_phone"),
+    ],
+    [
+      Markup.button.callback("💼 Должность", "change_position"),
+      Markup.button.callback("🏢 Отдел", "change_department"),
+    ],
+  ]);
+
+  await ctx.reply("Что хотите изменить?", keyboard);
+}
+
+// Функция для обработки выбора поля для изменения
+async function handleFieldChange(ctx, field, userState) {
+  const telegramId = ctx.from?.id;
+  if (!telegramId) return;
+
+  let step = "";
+  let prompt = "";
+
+  switch (field) {
+    case "fio":
+      step = "editing_fio";
+      prompt = "Введите новое ФИО:";
+      break;
+    case "phone":
+      step = "editing_phone";
+      prompt = "Введите новый номер телефона:";
+      break;
+    case "position":
+      step = "editing_position";
+      prompt = "Введите новую должность:";
+      break;
+    case "department":
+      step = "editing_department";
+      prompt = "Введите новый отдел:";
+      break;
+    default:
+      await ctx.reply("Неизвестное поле.");
+      return;
+  }
+
+  userState.step = step;
+  await ctx.reply(prompt);
+}
+
 let adminLogChatIdCache = null;
+let newsChannelIdCache = null;
+async function getNewsChannelId() {
+  if (newsChannelIdCache !== null) return newsChannelIdCache;
+
+  const settings = await prismaMeta.adminSettings.findUnique({ where: { id: 1 } });
+  newsChannelIdCache = settings?.newsChannelId || config.newsChannelId || null;
+
+  return newsChannelIdCache;
+}
+
+async function handleNewsCommand(ctx) {
+  if (!(await hasAdminAccess(ctx))) {
+    await ctx.reply("Нет прав для выполнения этой команды.");
+    return;
+  }
+
+  const newsChannelId = await getNewsChannelId();
+  if (!newsChannelId) {
+    await ctx.reply(
+      "Новостной канал не настроен. Используй /set_news_channel в нужном канале или задай NEWS_CHANNEL_ID в .env."
+    );
+    return;
+  }
+
+  const message = ctx.message;
+
+  const captionFromText = message?.text
+    ?.replace(/^\/news(@\w+)?\s*/i, "")
+    .trim();
+
+  const isPhoto = Array.isArray(message?.photo) && message.photo.length > 0;
+  const photoFileId = isPhoto ? message.photo[message.photo.length - 1].file_id : null;
+  const captionFromPhoto = message?.caption
+    ?.replace(/^\/news(@\w+)?\s*/i, "")
+    .trim();
+
+  const newsText = isPhoto ? captionFromPhoto : captionFromText;
+
+  if (isPhoto && !newsText) {
+    await ctx.reply("Добавь текст новости в подпись к фото после команды /news.");
+    return;
+  }
+
+  if (!isPhoto && !newsText) {
+    await ctx.reply("Напиши текст новости после команды: /news текст новости");
+    return;
+  }
+
+  try {
+    if (isPhoto && photoFileId) {
+      await ctx.telegram.sendPhoto(newsChannelId, photoFileId, {
+        caption: newsText,
+        parse_mode: "HTML",
+      });
+    } else {
+      await ctx.telegram.sendMessage(newsChannelId, newsText, {
+        parse_mode: "HTML",
+      });
+    }
+    await ctx.reply("Новость отправлена в новостной канал.");
+  } catch (err) {
+    console.error(err);
+    await ctx.reply(
+      "Не удалось отправить новость. Проверь, что бот добавлен в канал и имеет права на отправку сообщений."
+    );
+  }
+}
 
 function parseSingleMessage(text) {
   if (!text) return null;
@@ -634,6 +1201,91 @@ async function handleVerificationAndLink(ctx, form) {
     return;
   }
 
+  // Блокируем уволенных или уже в чёрном списке
+  if (employee.blacklisted) {
+    await prisma.auditLog.create({
+      data: {
+        telegramId: BigInt(telegramId),
+        action: "blacklisted_attempt",
+        payloadJson: JSON.stringify({ empId: employee.id, form }),
+      },
+    });
+    await ctx.reply("Произошла ошибка. Попробуй позже или обратись к администратору.");
+    return;
+  }
+
+  if (employee.fired) {
+    // Пытаемся выгнать из канала отдела и новостного канала
+    try {
+      const channelId = await resolveChannelId(employee.department);
+      await ctx.telegram.banChatMember(channelId, Number(telegramId));
+    } catch (err) {
+      console.error("Failed to ban from department channel for fired user", err);
+    }
+
+    try {
+      const newsChannelId = await getNewsChannelId();
+      if (newsChannelId) {
+        await ctx.telegram.banChatMember(newsChannelId, Number(telegramId));
+      }
+    } catch (err) {
+      console.error("Failed to ban from news channel for fired user", err);
+    }
+
+    await prisma.employeeRef.update({
+      where: { id: employee.id },
+      data: { blacklisted: true },
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        telegramId: BigInt(telegramId),
+        action: "fired_blocked",
+        payloadJson: JSON.stringify({ empId: employee.id, form }),
+      },
+    });
+
+    await ctx.reply("Произошла ошибка. Попробуй позже или обратись к администратору.");
+    return;
+  }
+
+  // Если сотрудник уже привязан к другому Telegram — уведомляем владельца и запрашиваем подтверждение
+  if (employee.telegramId && BigInt(telegramId) !== employee.telegramId) {
+    const sessionId = createSessionId();
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 минут
+    pendingSessions.set(sessionId, { requesterId: telegramId, form, expiresAt });
+
+    // Сообщение тому, кто пытается войти
+    await ctx.reply(
+      "Идет проверка данных..."
+    );
+
+    // Уведомление владельцу записи
+    try {
+      await ctx.telegram.sendMessage(
+        Number(employee.telegramId),
+        [
+          "Под вашими данными кто-то пытается войти!",
+          "Если это вы — нажмите «Разрешить», если нет — «Заблокировать сессию».",
+        ].join("\n"),
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "✅ Разрешить", callback_data: `session_allow_${sessionId}` },
+                { text: "⛔ Отклонить попытку входа", callback_data: `session_block_${sessionId}` },
+              ],
+            ],
+          },
+        }
+      );
+    } catch (err) {
+      console.error("Failed to notify bound user about session", err);
+    }
+
+    return; // ждём решения владельца
+  }
+
   await prisma.auditLog.create({
     data: {
       telegramId: BigInt(telegramId),
@@ -645,11 +1297,30 @@ async function handleVerificationAndLink(ctx, form) {
   // Привязываем telegramId к записи сотрудника, если ещё не привязано
   if (!employee.telegramId || !employee.telegramUsername) {
     try {
+      // Проверяем, можно ли сохранить telegramId
+      const existingByTelegram = await prisma.employeeRef.findUnique({
+        where: { telegramId: BigInt(telegramId) },
+      });
+      const isSameId =
+        employee.telegramId && String(employee.telegramId) === String(telegramId);
+      const canSetTelegramId =
+        isSameId ||
+        (!employee.telegramId && (!existingByTelegram || existingByTelegram.id === employee.id));
+
+      // Если нельзя привязать (уже занято другим сотрудником) и текущая запись без telegramId — останавливаемся
+      if (!canSetTelegramId && !employee.telegramId) {
+        await ctx.reply(
+          "Этот Telegram уже привязан к другому сотруднику. Обратись к администратору."
+        );
+        return;
+      }
+
       await prisma.employeeRef.update({
         where: { id: employee.id },
         data: {
-          telegramId: employee.telegramId ? undefined : BigInt(telegramId),
+          telegramId: canSetTelegramId ? BigInt(telegramId) : undefined,
           telegramUsername: ctx.from?.username || null,
+          phoneNumber: form.phoneNumber || undefined,
         },
       });
     } catch (err) {
@@ -662,6 +1333,7 @@ async function handleVerificationAndLink(ctx, form) {
     update: {
       empId: employee.id,
       fullName: employee.fullName,
+      phoneNumber: form.phoneNumber || null,
       position: employee.position,
       department: employee.department,
       telegramUsername: ctx.from?.username || null,
@@ -671,6 +1343,7 @@ async function handleVerificationAndLink(ctx, form) {
       telegramId: BigInt(telegramId),
       empId: employee.id,
       fullName: employee.fullName,
+      phoneNumber: form.phoneNumber || null,
       position: employee.position,
       department: employee.department,
       telegramUsername: ctx.from?.username || null,
@@ -679,7 +1352,10 @@ async function handleVerificationAndLink(ctx, form) {
   });
 
   let invite;
+  let newsInvite = null;
   try {
+    const newsChannelId = await getNewsChannelId();
+
     invite = await getOrCreateInviteLink({
       telegram: ctx.telegram,
       prisma,
@@ -687,6 +1363,15 @@ async function handleVerificationAndLink(ctx, form) {
       fullName: user.fullName,
       channelId: await resolveChannelId(form.department),
     });
+    if (newsChannelId) {
+      newsInvite = await getOrCreateInviteLink({
+        telegram: ctx.telegram,
+        prisma,
+        telegramId,
+        fullName: user.fullName,
+        channelId: newsChannelId,
+      });
+    }
   } catch (err) {
     console.error(err);
     if (
@@ -716,10 +1401,31 @@ async function handleVerificationAndLink(ctx, form) {
     },
   });
 
+  if (newsInvite) {
+    await prisma.auditLog.create({
+      data: {
+        telegramId: BigInt(telegramId),
+        action: "news_invite_issued",
+        payloadJson: JSON.stringify({
+          inviteLinkId: newsInvite.inviteLinkId,
+          expiresAt: newsInvite.expiresAt,
+          channelId: newsInvite.channelId,
+        }),
+      },
+    });
+  }
+
   const expiresAtText = formatISO9075(invite.expiresAt);
-  await ctx.reply(
-    `Твоя персональная ссылка:\n${invite.url}\nДействует до: ${expiresAtText}\nЕсли истечет или будет использована — запусти /start ещё раз.`
-  );
+  let reply = `Твоя персональная ссылка в канал отдела:\n${invite.url}\nДействует до: ${expiresAtText}`;
+
+  if (newsInvite) {
+    const newsExpiresAtText = formatISO9075(newsInvite.expiresAt);
+    reply += `\n\nТвоя персональная ссылка в новостной канал:\n${newsInvite.url}\nДействует до: ${newsExpiresAtText}`;
+  }
+
+  reply += `\n\nЕсли ссылка истечет или будет использована — запусти /start ещё раз.`;
+
+  await ctx.reply(reply);
 }
 
 async function resolveChannelId(department) {

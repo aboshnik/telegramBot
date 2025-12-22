@@ -6,16 +6,31 @@ async function main() {
       fullName: "Иванов Иван Иванович",
       position: "Инженер",
       department: "Отдел разработки",
+      phoneNumber: "9001112233",
     },
     {
       fullName: "Петров Петр Петрович",
       position: "Менеджер",
       department: "Отдел продаж",
+      phoneNumber: "9002223344",
     },
     {
       fullName: "Сидорова Анна Сергеевна",
       position: "HR",
       department: "Отдел кадров",
+      phoneNumber: "9003334455",
+    },
+    {
+      fullName: "Кузнецов Дмитрий Олегович",
+      position: "Разработчик",
+      department: "Отдел разработки",
+      phoneNumber: "9004445566",
+    },
+    {
+      fullName: "Алексеева Мария Ивановна",
+      position: "Аналитик",
+      department: "Отдел кадров",
+      phoneNumber: "9005556677",
     },
   ];
 
@@ -34,7 +49,10 @@ async function main() {
           department: emp.department,
         },
       },
-      update: { active: true },
+      update: {
+        active: true,
+        phoneNumber: emp.phoneNumber,
+      },
       create: emp,
     });
   }

@@ -10,6 +10,7 @@ const toInt = (value, fallback) => {
 export const config = {
   botToken: process.env.BOT_TOKEN,
   channelId: process.env.CHANNEL_ID,
+  newsChannelId: process.env.NEWS_CHANNEL_ID || null,
   dbUrl: process.env.DB_URL || "file:./dev.db",
   metaDbUrl: process.env.META_DB_URL || "file:./meta.db",
   adminLogChatId: process.env.ADMIN_LOG_CHAT_ID || null, // fallback; can be set via command

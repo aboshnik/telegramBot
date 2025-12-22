@@ -1,8 +1,119 @@
 import { createBot } from "./bot.js";
-import { disconnectDb } from "./db.js";
-import { disconnectMetaDb } from "./dbMeta.js";
+import { prisma, disconnectDb } from "./db.js";
+import { prismaMeta, disconnectMetaDb } from "./dbMeta.js";
+import { config } from "./config.js";
 
 const bot = createBot();
+
+// Периодическая очистка устаревших инвайтов (expiresAt < now)
+const INVITE_CLEANUP_MS = 60 * 60 * 1000; // раз в час
+const NIGHT_CHECK_MS = 15 * 60 * 1000; // проверка статусов раз в 15 минут
+
+async function cleanupExpiredInvites() {
+  try {
+    const now = new Date();
+    const res = await prisma.inviteLink.deleteMany({
+      where: { expiresAt: { lt: now } },
+    });
+    if (res.count > 0) {
+      console.log(`Invite cleanup: удалено ${res.count} просроченных ссылок`);
+    }
+  } catch (err) {
+    console.error("Invite cleanup failed", err);
+  }
+}
+
+// Час по Москве (UTC+3)
+function getMoscowHour(date) {
+  const utcHour = date.getUTCHours();
+  return (utcHour + 3 + 24) % 24;
+}
+
+function isWithinMoscowNightWindow(date) {
+  const h = getMoscowHour(date);
+  return h >= 0 && h < 5;
+}
+
+async function getNewsChannelIdForCron() {
+  try {
+    const settings = await prismaMeta.adminSettings.findUnique({ where: { id: 1 } });
+    return settings?.newsChannelId || config.newsChannelId || null;
+  } catch (err) {
+    console.error("Failed to load news channel id for cron", err);
+    return config.newsChannelId || null;
+  }
+}
+
+async function processFiredAndBlacklisted() {
+  const now = new Date();
+  if (!isWithinMoscowNightWindow(now)) return;
+
+  try {
+    const employees = await prisma.employeeRef.findMany({
+      where: {
+        OR: [{ fired: true }, { blacklisted: true }],
+        telegramId: { not: null },
+      },
+    });
+
+    if (!employees.length) return;
+
+    const newsChannelId = await getNewsChannelIdForCron();
+
+    for (const emp of employees) {
+      const tgId = Number(emp.telegramId);
+
+      // Канал отдела
+      try {
+        const mapping = await prismaMeta.departmentChannel.findFirst({
+          where: { department: emp.department },
+        });
+        const deptChannelId = mapping?.channelId || config.channelId || null;
+        if (deptChannelId) {
+          await bot.telegram.banChatMember(deptChannelId, tgId);
+        }
+      } catch (err) {
+        console.error("Night check: failed to ban from department channel", err);
+      }
+
+      // Новостной канал
+      if (newsChannelId) {
+        try {
+          await bot.telegram.banChatMember(newsChannelId, tgId);
+        } catch (err) {
+          console.error("Night check: failed to ban from news channel", err);
+        }
+      }
+
+      try {
+        await prisma.employeeRef.update({
+          where: { id: emp.id },
+          data: { blacklisted: true },
+        });
+      } catch (err) {
+        console.error("Night check: failed to mark blacklisted", err);
+      }
+
+      try {
+        await prisma.auditLog.create({
+          data: {
+            telegramId: BigInt(emp.telegramId),
+            action: "night_auto_block",
+            payloadJson: JSON.stringify({
+              empId: emp.id,
+              fired: emp.fired,
+              blacklisted: emp.blacklisted,
+            }),
+          },
+        });
+      } catch (err) {
+        console.error("Night check: failed to write audit log", err);
+      }
+    }
+  } catch (err) {
+    console.error("Night check failed", err);
+  }
+}
 
 // Логи ошибок, чтобы процесс не "падал молча"
 process.on("unhandledRejection", (reason) => {
@@ -16,6 +127,12 @@ async function startBot() {
   try {
     await bot.launch();
     console.log("Bot is running...");
+    // Стартуем очистку инвайтов
+    cleanupExpiredInvites();
+    setInterval(cleanupExpiredInvites, INVITE_CLEANUP_MS);
+    // Стартуем ночную проверку статусов
+    processFiredAndBlacklisted();
+    setInterval(processFiredAndBlacklisted, NIGHT_CHECK_MS);
   } catch (err) {
     console.error("Bot launch failed:", err);
     // На Replit платформа часто сама перезапускает процесс, но лучше явно упасть с кодом ошибки.
