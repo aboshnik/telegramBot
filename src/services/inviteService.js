@@ -1,11 +1,12 @@
 import { addHours } from "date-fns";
 import { config } from "../config.js";
+import { prismaMeta } from "../dbMeta.js";
 
 const isActiveLink = (link) =>
   link.status === "ACTIVE" && link.expiresAt > new Date();
 
 export async function getActiveLink(prisma, telegramId, channelId) {
-  return prisma.inviteLink.findFirst({
+  return prismaMeta.inviteLink.findFirst({
     where: {
       telegramId: BigInt(telegramId),
       status: "ACTIVE",
@@ -35,7 +36,7 @@ export async function createInviteLink({
 
   const ttlSeconds = ttlHours * 3600;
 
-  const record = await prisma.inviteLink.create({
+  const record = await prismaMeta.inviteLink.create({
     data: {
       telegramId: BigInt(telegramId),
       url: invite.invite_link,
@@ -66,7 +67,7 @@ export async function getOrCreateInviteLink({
 }
 
 export async function expireInviteLink(prisma, inviteLinkId) {
-  return prisma.inviteLink.updateMany({
+  return prismaMeta.inviteLink.updateMany({
     where: { inviteLinkId, status: "ACTIVE" },
     data: { status: "EXPIRED" },
   });

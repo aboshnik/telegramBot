@@ -12,14 +12,19 @@ const NIGHT_CHECK_MS = 15 * 60 * 1000; // проверка статусов ра
 async function cleanupExpiredInvites() {
   try {
     const now = new Date();
-    const res = await prisma.inviteLink.deleteMany({
+    const res = await prismaMeta.inviteLink.deleteMany({
       where: { expiresAt: { lt: now } },
     });
     if (res.count > 0) {
       console.log(`Invite cleanup: удалено ${res.count} просроченных ссылок`);
     }
   } catch (err) {
-    console.error("Invite cleanup failed", err);
+    // Игнорируем ошибку, если таблица не существует (P2021)
+    if (err.code === 'P2021') {
+      console.log("InviteLink table does not exist, skipping cleanup");
+    } else {
+      console.error("Invite cleanup failed", err);
+    }
   }
 }
 
@@ -49,7 +54,7 @@ async function processFiredAndBlacklisted() {
   if (!isWithinMoscowNightWindow(now)) return;
 
   try {
-    const employees = await prisma.employeeRef.findMany({
+    const employees = await prismaMeta.employeeRef.findMany({
       where: {
         OR: [{ fired: true }, { blacklisted: true }],
         telegramId: { not: null },
@@ -86,7 +91,7 @@ async function processFiredAndBlacklisted() {
       }
 
       try {
-        await prisma.employeeRef.update({
+        await prismaMeta.employeeRef.update({
           where: { id: emp.id },
           data: { blacklisted: true },
         });
@@ -95,7 +100,7 @@ async function processFiredAndBlacklisted() {
       }
 
       try {
-        await prisma.auditLog.create({
+        await prismaMeta.auditLog.create({
           data: {
             telegramId: BigInt(emp.telegramId),
             action: "night_auto_block",

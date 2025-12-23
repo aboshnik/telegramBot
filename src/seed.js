@@ -1,4 +1,4 @@
-import { prisma } from "./db.js";
+import { prismaMeta } from "./dbMeta.js";
 
 async function main() {
   const employees = [
@@ -41,7 +41,7 @@ async function main() {
   ];
 
   for (const emp of employees) {
-    await prisma.employeeRef.upsert({
+    await prismaMeta.employeeRef.upsert({
       where: {
         fullName_position_department: {
           fullName: emp.fullName,
@@ -58,7 +58,7 @@ async function main() {
   }
 
   for (const dc of departmentChannels) {
-    await prisma.departmentChannel.upsert({
+    await prismaMeta.departmentChannel.upsert({
       where: { department: dc.department },
       update: { channelId: dc.channelId },
       create: dc,
@@ -69,11 +69,11 @@ async function main() {
 main()
   .then(async () => {
     console.log("Seed completed");
-    await prisma.$disconnect();
+    await prismaMeta.$disconnect();
   })
   .catch(async (e) => {
     console.error(e);
-    await prisma.$disconnect();
+    await prismaMeta.$disconnect();
     process.exit(1);
   });
 

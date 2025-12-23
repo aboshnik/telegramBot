@@ -16,13 +16,42 @@ const userStates = new Map(); // telegramId -> { step, data: { fullName, phoneNu
 // Регулярное выражение для валидации номера телефона (разрешаем +7, цифры и разделители)
 const phoneRegex = /^\+?[\d\s\-\(\)]+$/;
 
-// Нормализация телефона: оставляем только цифры, если начинается с 7 (11 цифр) - убираем первую 7
+// Нормализация телефона: обрабатываем все возможные форматы (+7, 8, прямой ввод с 9)
+// Результат: всегда 10 цифр, начинающихся с 9 (код оператора)
 const normalizePhone = (text) => {
   const digits = text.replace(/\D/g, "");
-  // Если номер начинается с 7 (11 цифр), убираем первую 7, оставляем 10 цифр
+  
+  // Если номер начинается с 7 (11 цифр): +7 900 111-22-33 или 79001112233
+  // Убираем первую 7, оставляем 10 цифр
   if (digits.length === 11 && digits.startsWith("7")) {
     return digits.slice(1);
   }
+  
+  // Если номер начинается с 8 (11 цифр): 8 900 111-22-33 или 89001112233
+  // Убираем первую 8, оставляем 10 цифр
+  if (digits.length === 11 && digits.startsWith("8")) {
+    return digits.slice(1);
+  }
+  
+  // Если номер 10 цифр и начинается с 9: 900 111-22-33 или 9001112233
+  // Оставляем как есть
+  if (digits.length === 10 && digits.startsWith("9")) {
+    return digits;
+  }
+  
+  // Если номер 10 цифр и начинается с 8: 8805353341
+  // Убираем первую 8, оставляем 9 цифр (добавим 9 в начале)
+  if (digits.length === 10 && digits.startsWith("8")) {
+    return "9" + digits.slice(1);
+  }
+  
+  // Если номер 9 цифр: 805353341
+  // Добавляем 9 в начало
+  if (digits.length === 9) {
+    return "9" + digits;
+  }
+  
+  // Возвращаем как есть (на случай других форматов)
   return digits;
 };
 
@@ -53,13 +82,13 @@ export function createBot() {
 
     // Сбрасываем состояние и начинаем заново
     userStates.set(telegramId, {
-      step: "waiting_fio",
+      step: "waiting_lastName",
       data: {}
     });
 
     await ctx.reply(
       "Добро пожаловать! Введите следующие данные, соблюдая этапы:\n\n" +
-      "1. ФИО"
+      "1. Фамилия"
     );
   });
 
@@ -73,12 +102,12 @@ export function createBot() {
     
     await ctx.reply(
       "Начинаем заново. Введите следующие данные, соблюдая этапы:\n\n" +
-      "1. ФИО"
+      "1. Фамилия"
     );
     
     if (telegramId) {
       userStates.set(telegramId, {
-        step: "waiting_fio",
+        step: "waiting_lastName",
         data: {}
       });
     }
@@ -216,7 +245,7 @@ export function createBot() {
       return;
     }
     try {
-      const employees = await prisma.employeeRef.findMany({
+      const employees = await prismaMeta.employeeRef.findMany({
         where: { active: true },
         orderBy: [{ department: "asc" }, { fullName: "asc" }],
         take: 200,
@@ -239,6 +268,41 @@ export function createBot() {
     } catch (err) {
       console.error(err);
       await ctx.reply("Не удалось выгрузить сотрудников. Попробуй позже.");
+    }
+  });
+
+  bot.command("test_data", async (ctx) => {
+    if (!(await hasAdminAccess(ctx))) {
+      await ctx.reply("Нет прав для выполнения этой команды.");
+      return;
+    }
+    try {
+      const employees = await prisma.lexemaCard.findMany({
+        take: 10,
+        orderBy: { code: 'asc' }
+      });
+      if (!employees.length) {
+        await ctx.reply("Список сотрудников пуст.");
+        return;
+      }
+      const lines = employees.flatMap((e) => [
+        `Код: ${e.code}`,
+        `Фамилия: ${e.lastName || '—'}`,
+        `Имя: ${e.firstName || '—'}`,
+        `Отчество: ${e.middleName || '—'}`,
+        `Подразделение: ${e.departmentId || '—'}`,
+        `Должность: ${e.positionId || '—'}`,
+        `ДатаУвольнения: ${e.terminationDate ? e.terminationDate.toISOString() : '—'}`,
+        `Сотовый: ${e.phone || '—'}`,
+        `ТелеграмЮзернейм: ${e.telegramUsername || '—'}`,
+        `ТелеграмID: ${e.telegramId || '—'}`,
+        `ЧерныйСписок: ${e.blacklisted === true ? 'Да' : e.blacklisted === false ? 'Нет' : '—'}`,
+        '' // empty line
+      ]);
+      await ctx.reply(lines.join('\n'));
+    } catch (err) {
+      console.error(err);
+      await ctx.reply("Ошибка при получении данных.");
     }
   });
 
@@ -265,7 +329,7 @@ export function createBot() {
     let employmentStatus = "активен";
     if (user.empId) {
       try {
-        const employee = await prisma.employeeRef.findUnique({
+        const employee = await prismaMeta.employeeRef.findUnique({
           where: { id: user.empId },
           select: { fired: true, blacklisted: true },
         });
@@ -416,6 +480,10 @@ export function createBot() {
       return;
     }
 
+    
+  
+
+
     let targetChannelId;
 
     if (isChannelContext) {
@@ -459,7 +527,7 @@ export function createBot() {
     }
 
     try {
-      const employees = await prisma.employeeRef.findMany({
+      const employees = await prismaMeta.employeeRef.findMany({
         where: {
           OR: [{ fired: true }, { blacklisted: true }],
           telegramId: { not: null },
@@ -495,7 +563,7 @@ export function createBot() {
         }
 
         try {
-          await prisma.employeeRef.update({
+          await prismaMeta.employeeRef.update({
             where: { id: emp.id },
             data: { blacklisted: true },
           });
@@ -504,7 +572,7 @@ export function createBot() {
         }
 
         try {
-          await prisma.auditLog.create({
+          await prismaMeta.auditLog.create({
             data: {
               telegramId: BigInt(emp.telegramId),
               action: "manual_check_block",
@@ -538,9 +606,9 @@ export function createBot() {
 
     try {
       // Удаляем ссылки, потом пользователей, потом обнуляем привязки сотрудников — чтобы не ловить FK ошибки
-      const linksResult = await prisma.inviteLink.deleteMany({});
-      const userResult = await prisma.user.deleteMany({});
-      const empResult = await prisma.employeeRef.updateMany({
+      const linksResult = await prismaMeta.inviteLink.deleteMany({});
+      const userResult = await prismaMeta.user.deleteMany({});
+      const empResult = await prismaMeta.employeeRef.updateMany({
         data: { telegramId: null, telegramUsername: null },
       });
 
@@ -629,7 +697,7 @@ export function createBot() {
 
     try {
       await ctx.telegram.banChatMember(channelId, Number(user.telegramId));
-      await prisma.auditLog.create({
+      await prismaMeta.auditLog.create({
         data: {
           telegramId: BigInt(ctx.from.id),
           action: "remove_user",
@@ -656,7 +724,7 @@ export function createBot() {
       );
     } catch (err) {
       console.error(err);
-      await prisma.auditLog.create({
+      await prismaMeta.auditLog.create({
         data: {
           telegramId: BigInt(ctx.from.id),
           action: "remove_user_failed",
@@ -709,95 +777,133 @@ export function createBot() {
     try {
       // Обрабатываем каждый этап
       switch (userState.step) {
-        case "waiting_fio":
-          if (!text || text.length < 3) {
-            await ctx.reply("Пожалуйста, введите ФИО (минимум 3 символа).");
+        case "waiting_lastName":
+          if (!text || text.length < 2) {
+            await ctx.reply("Пожалуйста, введите фамилию (минимум 2 символа).");
             return;
           }
-          userState.data.fullName = text;
+          userState.data.lastName = text.trim();
+          userState.step = "waiting_firstName";
+          await ctx.reply("2. Имя");
+          break;
+
+        case "waiting_firstName":
+          if (!text || text.length < 2) {
+            await ctx.reply("Пожалуйста, введите имя (минимум 2 символа).");
+            return;
+          }
+          userState.data.firstName = text.trim();
+          userState.step = "waiting_middleName";
+          await ctx.reply("3. Отчество (если нет, введите \"-\")");
+          break;
+
+        case "waiting_middleName":
+          userState.data.middleName = text.trim() === "-" ? null : text.trim();
+          userState.step = "waiting_positionId";
+          await ctx.reply("4. Должность (ID - число)");
+          break;
+
+        case "waiting_positionId":
+          const positionId = parseInt(text.trim());
+          if (isNaN(positionId)) {
+            await ctx.reply("Пожалуйста, введите корректный ID должности (число).");
+            return;
+          }
+          userState.data.positionId = positionId;
+          userState.step = "waiting_departmentId";
+          await ctx.reply("5. Подразделение (ID - число)");
+          break;
+
+        case "waiting_departmentId":
+          const departmentId = parseInt(text.trim());
+          if (isNaN(departmentId)) {
+            await ctx.reply("Пожалуйста, введите корректный ID подразделения (число).");
+            return;
+          }
+          userState.data.departmentId = departmentId;
           userState.step = "waiting_phone";
-          await ctx.reply("2. Номер телефона");
+          await ctx.reply("6. Номер телефона");
           break;
 
         case "waiting_phone":
-          // Валидация: пользователь может ввести номер с +7 или без, в итоге должно быть 10 цифр, начиная с 9
+          // Валидация: принимаем все форматы (+7, 8, прямой ввод с 9)
           if (!phoneRegex.test(text)) {
-            await ctx.reply("Пожалуйста, введите номер телефона в формате +7 900 111-22-33 или 900-111-22-33.");
+            await ctx.reply("Пожалуйста, введите номер телефона в любом формате:\n+7 900 111-22-33\n8 900 111-22-33\n900-111-22-33\n89001112233");
             return;
           }
           const phoneDigits = normalizePhone(text);
+          // После нормализации должно быть 10 цифр, начинающихся с 9
           if (phoneDigits.length !== 10 || !phoneDigits.startsWith("9")) {
-            await ctx.reply("Пожалуйста, введите корректный номер телефона. Пример: +7 900 111-22-33 или 900-111-22-33.");
+            await ctx.reply("Пожалуйста, введите корректный номер телефона в любом формате:\n+7 900 111-22-33\n8 900 111-22-33\n900-111-22-33\n89001112233");
             return;
           }
           userState.data.phoneNumber = phoneDigits;
-          userState.step = "waiting_position";
-          await ctx.reply("3. Должность");
-          break;
-
-        case "waiting_position":
-          if (!text || text.length < 2) {
-            await ctx.reply("Пожалуйста, введите должность (минимум 2 символа).");
-            return;
-          }
-          userState.data.position = text;
-          userState.step = "waiting_department";
-          await ctx.reply("4. Отдел");
-          break;
-
-        case "waiting_department":
-          if (!text || text.length < 2) {
-            await ctx.reply("Пожалуйста, введите отдел (минимум 2 символа).");
-            return;
-          }
-          userState.data.department = text;
           
           // Все данные собраны, показываем подтверждение
           await showDataConfirmation(ctx, userState.data);
           userState.step = "confirming_data";
           break;
 
-        case "editing_fio":
-          if (!text || text.length < 3) {
-            await ctx.reply("Пожалуйста, введите ФИО (минимум 3 символа).");
+        case "editing_lastName":
+          if (!text || text.length < 2) {
+            await ctx.reply("Пожалуйста, введите фамилию (минимум 2 символа).");
             return;
           }
-          userState.data.fullName = text;
+          userState.data.lastName = text.trim();
+          await showDataConfirmation(ctx, userState.data);
+          userState.step = "confirming_data";
+          break;
+
+        case "editing_firstName":
+          if (!text || text.length < 2) {
+            await ctx.reply("Пожалуйста, введите имя (минимум 2 символа).");
+            return;
+          }
+          userState.data.firstName = text.trim();
+          await showDataConfirmation(ctx, userState.data);
+          userState.step = "confirming_data";
+          break;
+
+        case "editing_middleName":
+          userState.data.middleName = text.trim() === "-" ? null : text.trim();
+          await showDataConfirmation(ctx, userState.data);
+          userState.step = "confirming_data";
+          break;
+
+        case "editing_positionId":
+          const editPositionId = parseInt(text.trim());
+          if (isNaN(editPositionId)) {
+            await ctx.reply("Пожалуйста, введите корректный ID должности (число).");
+            return;
+          }
+          userState.data.positionId = editPositionId;
+          await showDataConfirmation(ctx, userState.data);
+          userState.step = "confirming_data";
+          break;
+
+        case "editing_departmentId":
+          const editDepartmentId = parseInt(text.trim());
+          if (isNaN(editDepartmentId)) {
+            await ctx.reply("Пожалуйста, введите корректный ID подразделения (число).");
+            return;
+          }
+          userState.data.departmentId = editDepartmentId;
           await showDataConfirmation(ctx, userState.data);
           userState.step = "confirming_data";
           break;
 
         case "editing_phone":
           if (!phoneRegex.test(text)) {
-            await ctx.reply("Пожалуйста, введите номер телефона в формате +7 900 111-22-33 или 900-111-22-33.");
+            await ctx.reply("Пожалуйста, введите номер телефона в любом формате:\n+7 900 111-22-33\n8 900 111-22-33\n900-111-22-33\n89001112233");
             return;
           }
           const editPhoneDigits = normalizePhone(text);
+          // После нормализации должно быть 10 цифр, начинающихся с 9
           if (editPhoneDigits.length !== 10 || !editPhoneDigits.startsWith("9")) {
-            await ctx.reply("Пожалуйста, введите корректный номер телефона. Пример: +7 900 111-22-33 или 900-111-22-33.");
+            await ctx.reply("Пожалуйста, введите корректный номер телефона в любом формате:\n+7 900 111-22-33\n8 900 111-22-33\n900-111-22-33\n89001112233");
             return;
           }
           userState.data.phoneNumber = editPhoneDigits;
-          await showDataConfirmation(ctx, userState.data);
-          userState.step = "confirming_data";
-          break;
-
-        case "editing_position":
-          if (!text || text.length < 2) {
-            await ctx.reply("Пожалуйста, введите должность (минимум 2 символа).");
-            return;
-          }
-          userState.data.position = text;
-          await showDataConfirmation(ctx, userState.data);
-          userState.step = "confirming_data";
-          break;
-
-        case "editing_department":
-          if (!text || text.length < 2) {
-            await ctx.reply("Пожалуйста, введите отдел (минимум 2 символа).");
-            return;
-          }
-          userState.data.department = text;
           await showDataConfirmation(ctx, userState.data);
           userState.step = "confirming_data";
           break;
@@ -863,7 +969,7 @@ export function createBot() {
   });
 
   // Обработчик для выбора конкретного поля для изменения
-  bot.action(/^change_(fio|phone|position|department)$/, async (ctx) => {
+  bot.action(/^change_(lastName|firstName|middleName|positionId|departmentId|phone)$/, async (ctx) => {
     if (!isPrivate(ctx)) return;
     
     const telegramId = ctx.from?.id;
@@ -897,10 +1003,12 @@ async function showDataConfirmation(ctx, data) {
   
   const dataText = 
     "Проверь данные:\n\n" +
-    `👤 ФИО: ${data.fullName || "не указано"}\n` +
-    `📞 Телефон: ${formattedPhone}\n` +
-    `💼 Должность: ${data.position || "не указано"}\n` +
-    `🏢 Отдел: ${data.department || "не указано"}`;
+    `👤 Фамилия: ${data.lastName || "не указано"}\n` +
+    `👤 Имя: ${data.firstName || "не указано"}\n` +
+    `👤 Отчество: ${data.middleName || "не указано"}\n` +
+    `💼 Должность (ID): ${data.positionId || "не указано"}\n` +
+    `🏢 Подразделение (ID): ${data.departmentId || "не указано"}\n` +
+    `📞 Телефон: ${formattedPhone}`;
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback("✅ Подтвердить", "confirm")],
@@ -914,12 +1022,16 @@ async function showDataConfirmation(ctx, data) {
 async function showEditMenu(ctx) {
   const keyboard = Markup.inlineKeyboard([
     [
-      Markup.button.callback("👤 ФИО", "change_fio"),
-      Markup.button.callback("📞 Телефон", "change_phone"),
+      Markup.button.callback("👤 Фамилия", "change_lastName"),
+      Markup.button.callback("👤 Имя", "change_firstName"),
     ],
     [
-      Markup.button.callback("💼 Должность", "change_position"),
-      Markup.button.callback("🏢 Отдел", "change_department"),
+      Markup.button.callback("👤 Отчество", "change_middleName"),
+      Markup.button.callback("💼 Должность", "change_positionId"),
+    ],
+    [
+      Markup.button.callback("🏢 Подразделение", "change_departmentId"),
+      Markup.button.callback("📞 Телефон", "change_phone"),
     ],
   ]);
 
@@ -935,21 +1047,29 @@ async function handleFieldChange(ctx, field, userState) {
   let prompt = "";
 
   switch (field) {
-    case "fio":
-      step = "editing_fio";
-      prompt = "Введите новое ФИО:";
+    case "lastName":
+      step = "editing_lastName";
+      prompt = "Введите новую фамилию:";
+      break;
+    case "firstName":
+      step = "editing_firstName";
+      prompt = "Введите новое имя:";
+      break;
+    case "middleName":
+      step = "editing_middleName";
+      prompt = "Введите новое отчество (если нет, введите \"-\"):";
+      break;
+    case "positionId":
+      step = "editing_positionId";
+      prompt = "Введите новый ID должности (число):";
+      break;
+    case "departmentId":
+      step = "editing_departmentId";
+      prompt = "Введите новый ID подразделения (число):";
       break;
     case "phone":
       step = "editing_phone";
       prompt = "Введите новый номер телефона:";
-      break;
-    case "position":
-      step = "editing_position";
-      prompt = "Введите новую должность:";
-      break;
-    case "department":
-      step = "editing_department";
-      prompt = "Введите новый отдел:";
       break;
     default:
       await ctx.reply("Неизвестное поле.");
@@ -1074,13 +1194,13 @@ function resolveTarget(ctx) {
 
 async function findUserByTarget(target) {
   if (target.telegramId) {
-    const user = await prisma.user.findUnique({
+    const user = await prismaMeta.user.findUnique({
       where: { telegramId: BigInt(target.telegramId) },
     });
     if (user) return user;
   }
   if (target.username) {
-    const found = await prisma.user.findFirst({
+    const found = await prismaMeta.user.findFirst({
       where: {
         OR: [
           { telegramUsername: target.username },
@@ -1185,13 +1305,20 @@ async function handleVerificationAndLink(ctx, form) {
     return;
   }
 
-  const employee = await findEmployee(prisma, form);
+  const employee = await findEmployee(prisma, {
+    lastName: form.lastName,
+    firstName: form.firstName,
+    middleName: form.middleName,
+    positionId: form.positionId,
+    departmentId: form.departmentId,
+    phoneNumber: form.phoneNumber,
+  });
 
   if (!employee) {
     await ctx.reply(
       "Не нашли тебя в справочнике. Проверь данные или обратись к администратору."
     );
-    await prisma.auditLog.create({
+    await prismaMeta.auditLog.create({
       data: {
         telegramId: BigInt(telegramId),
         action: "verification_failed",
@@ -1203,24 +1330,46 @@ async function handleVerificationAndLink(ctx, form) {
 
   // Блокируем уволенных или уже в чёрном списке
   if (employee.blacklisted) {
-    await prisma.auditLog.create({
+    await prismaMeta.auditLog.create({
       data: {
         telegramId: BigInt(telegramId),
         action: "blacklisted_attempt",
-        payloadJson: JSON.stringify({ empId: employee.id, form }),
+        payloadJson: JSON.stringify({ code: employee.code, form }),
       },
     });
     await ctx.reply("Произошла ошибка. Попробуй позже или обратись к администратору.");
     return;
   }
 
-  if (employee.fired) {
+  // Проверяем на уволенных (terminationDate не null)
+  if (employee.terminationDate) {
     // Пытаемся выгнать из канала отдела и новостного канала
     try {
-      const channelId = await resolveChannelId(employee.department);
-      await ctx.telegram.banChatMember(channelId, Number(telegramId));
+      // Используем departmentId как строку для resolveChannelId
+      const channelId = await resolveChannelId(String(employee.departmentId || ""));
+      // Проверяем, что это канал (начинается с - или @), а не private chat
+      if (channelId && (channelId.startsWith("-") || channelId.startsWith("@"))) {
+        try {
+          await ctx.telegram.banChatMember(channelId, Number(telegramId));
+        } catch (banErr) {
+          // Игнорируем ошибки "can't ban members in private chats" и "can't remove chat owner"
+          if (banErr?.response?.description?.includes("private chats") || 
+              banErr?.response?.description?.includes("chat owner")) {
+            console.log("Cannot ban user (private chat or owner):", banErr.response?.description);
+          } else {
+            throw banErr;
+          }
+        }
+      }
     } catch (err) {
-      console.error("Failed to ban from department channel for fired user", err);
+      // Игнорируем ошибки "can't ban members in private chats" и "can't remove chat owner"
+      if (err?.response?.description?.includes("private chats") || 
+          err?.response?.description?.includes("chat owner")) {
+        // Это нормально, просто логируем
+        console.log("Cannot ban user (private chat or owner):", err.response?.description);
+      } else {
+        console.error("Failed to ban from department channel for fired user", err);
+      }
     }
 
     try {
@@ -1229,19 +1378,32 @@ async function handleVerificationAndLink(ctx, form) {
         await ctx.telegram.banChatMember(newsChannelId, Number(telegramId));
       }
     } catch (err) {
-      console.error("Failed to ban from news channel for fired user", err);
+      // Игнорируем ошибки "can't ban members in private chats" и "can't remove chat owner"
+      if (err?.response?.description?.includes("private chats") || 
+          err?.response?.description?.includes("chat owner")) {
+        // Это нормально, просто логируем
+        console.log("Cannot ban user (private chat or owner):", err.response?.description);
+      } else {
+        console.error("Failed to ban from news channel for fired user", err);
+      }
     }
 
-    await prisma.employeeRef.update({
-      where: { id: employee.id },
-      data: { blacklisted: true },
-    });
+    try {
+      // Используем raw query для обновления BIT поля в SQL Server
+      await prisma.$executeRaw`
+        UPDATE Lexema_Kadry_LichnayaKartochka 
+        SET ЧерныйСписок = 1 
+        WHERE VCode = ${employee.code}
+      `;
+    } catch (err) {
+      console.error("Failed to update blacklisted", err);
+    }
 
-    await prisma.auditLog.create({
+    await prismaMeta.auditLog.create({
       data: {
         telegramId: BigInt(telegramId),
         action: "fired_blocked",
-        payloadJson: JSON.stringify({ empId: employee.id, form }),
+        payloadJson: JSON.stringify({ code: employee.code, form }),
       },
     });
 
@@ -1286,26 +1448,34 @@ async function handleVerificationAndLink(ctx, form) {
     return; // ждём решения владельца
   }
 
-  await prisma.auditLog.create({
-    data: {
-      telegramId: BigInt(telegramId),
-      action: "verification_success",
-      payloadJson: JSON.stringify({ ...form, empId: employee.id }),
-    },
-  });
+  // Формируем полное имя из частей
+  const fullNameParts = [
+    employee.lastName,
+    employee.firstName,
+    employee.middleName,
+  ].filter(Boolean);
+  const fullName = fullNameParts.length > 0 ? fullNameParts.join(" ") : "Не указано";
+
+    await prismaMeta.auditLog.create({
+      data: {
+        telegramId: BigInt(telegramId),
+        action: "verification_success",
+        payloadJson: JSON.stringify({ ...form, code: employee.code }),
+      },
+    });
 
   // Привязываем telegramId к записи сотрудника, если ещё не привязано
   if (!employee.telegramId || !employee.telegramUsername) {
     try {
       // Проверяем, можно ли сохранить telegramId
-      const existingByTelegram = await prisma.employeeRef.findUnique({
+      const existingByTelegram = await prisma.lexemaCard.findFirst({
         where: { telegramId: BigInt(telegramId) },
       });
       const isSameId =
         employee.telegramId && String(employee.telegramId) === String(telegramId);
       const canSetTelegramId =
         isSameId ||
-        (!employee.telegramId && (!existingByTelegram || existingByTelegram.id === employee.id));
+        (!employee.telegramId && (!existingByTelegram || existingByTelegram.code === employee.code));
 
       // Если нельзя привязать (уже занято другим сотрудником) и текущая запись без telegramId — останавливаемся
       if (!canSetTelegramId && !employee.telegramId) {
@@ -1315,12 +1485,12 @@ async function handleVerificationAndLink(ctx, form) {
         return;
       }
 
-      await prisma.employeeRef.update({
-        where: { id: employee.id },
+      await prisma.lexemaCard.update({
+        where: { code: employee.code },
         data: {
           telegramId: canSetTelegramId ? BigInt(telegramId) : undefined,
           telegramUsername: ctx.from?.username || null,
-          phoneNumber: form.phoneNumber || undefined,
+          phone: form.phoneNumber || undefined,
         },
       });
     } catch (err) {
@@ -1328,24 +1498,25 @@ async function handleVerificationAndLink(ctx, form) {
     }
   }
 
-  const user = await prisma.user.upsert({
+  // Сохраняем в User (используем departmentId и positionId как строки для совместимости)
+  const user = await prismaMeta.user.upsert({
     where: { telegramId: BigInt(telegramId) },
     update: {
-      empId: employee.id,
-      fullName: employee.fullName,
+      empId: null, // LexemaCard не связан с EmployeeRef
+      fullName: fullName,
       phoneNumber: form.phoneNumber || null,
-      position: employee.position,
-      department: employee.department,
+      position: String(employee.positionId || ""),
+      department: String(employee.departmentId || ""),
       telegramUsername: ctx.from?.username || null,
       lastVerifiedAt: new Date(),
     },
     create: {
       telegramId: BigInt(telegramId),
-      empId: employee.id,
-      fullName: employee.fullName,
+      empId: null,
+      fullName: fullName,
       phoneNumber: form.phoneNumber || null,
-      position: employee.position,
-      department: employee.department,
+      position: String(employee.positionId || ""),
+      department: String(employee.departmentId || ""),
       telegramUsername: ctx.from?.username || null,
       lastVerifiedAt: new Date(),
     },
@@ -1361,7 +1532,7 @@ async function handleVerificationAndLink(ctx, form) {
       prisma,
       telegramId,
       fullName: user.fullName,
-      channelId: await resolveChannelId(form.department),
+      channelId: await resolveChannelId(String(form.departmentId || "")),
     });
     if (newsChannelId) {
       newsInvite = await getOrCreateInviteLink({
@@ -1389,7 +1560,7 @@ async function handleVerificationAndLink(ctx, form) {
     return;
   }
 
-  await prisma.auditLog.create({
+  await prismaMeta.auditLog.create({
     data: {
       telegramId: BigInt(telegramId),
       action: "invite_issued",
@@ -1402,7 +1573,7 @@ async function handleVerificationAndLink(ctx, form) {
   });
 
   if (newsInvite) {
-    await prisma.auditLog.create({
+    await prismaMeta.auditLog.create({
       data: {
         telegramId: BigInt(telegramId),
         action: "news_invite_issued",

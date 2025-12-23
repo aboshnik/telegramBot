@@ -41,3 +41,59 @@ model AdminSettings {
   newsChannelId  String?
 }
 
+model InviteLink {
+  id           Int      @id @default(autoincrement())
+  telegramId   BigInt
+  url          String   @unique
+  inviteLinkId String?
+  channelId    String   @default("")
+  expiresAt    DateTime
+  ttlSeconds   Int
+  status       String   @default("ACTIVE")
+  createdAt    DateTime @default(now())
+  usedAt       DateTime?
+
+  @@index([telegramId, status, expiresAt])
+}
+
+model AuditLog {
+  id          Int      @id @default(autoincrement())
+  telegramId  BigInt
+  action      String
+  payloadJson String
+  createdAt   DateTime @default(now())
+
+  @@index([telegramId, action])
+}
+
+model EmployeeRef {
+  id         Int      @id @default(autoincrement())
+  fullName   String
+  position   String
+  department String
+  phoneNumber String?
+  fired      Boolean  @default(false)
+  blacklisted Boolean @default(false)
+  telegramId BigInt?  @unique
+  telegramUsername String?
+  active     Boolean  @default(true)
+  users      User[]
+
+  @@index([fullName, position, department])
+  @@unique([fullName, position, department])
+}
+
+model User {
+  id             Int           @id @default(autoincrement())
+  telegramId     BigInt        @unique
+  telegramUsername String?
+  empId          Int?
+  fullName       String
+  phoneNumber    String?
+  position       String
+  department     String
+  createdAt      DateTime      @default(now())
+  lastVerifiedAt DateTime?
+  employee       EmployeeRef?  @relation(fields: [empId], references: [id])
+}
+

@@ -9,7 +9,6 @@ datasource db {
 
 model LexemaCard {
   code              Int       @id @map("VCode")
-  fullName          String?   @map("ФИОПолностью")
   lastName          String?   @map("Фамилия")
   firstName         String?   @map("Имя")
   middleName        String?   @map("Отчество")
@@ -19,78 +18,9 @@ model LexemaCard {
   phone             String?   @map("Сотовый")
   telegramUsername  String?   @map("ТелеграмЮзернейм")
   telegramId        BigInt?   @map("ТелеграмID")
-  blacklisted       Boolean   @default(false) @map("ЧерныйСписок")
+  blacklisted       Boolean?  @default(false) @map("ЧерныйСписок") @db.Bit
 
   @@map("Lexema_Kadry_LichnayaKartochka")
 }
 
-model EmployeeRef {
-  id         Int      @id @default(autoincrement())
-  fullName   String
-  position   String
-  department String
-  phoneNumber String?
-  fired      Boolean  @default(false)
-  blacklisted Boolean @default(false)
-  telegramId BigInt?  @unique
-  telegramUsername String?
-  active     Boolean  @default(true)
-  users      User[]
-
-  @@index([fullName, position, department])
-  @@unique([fullName, position, department])
-}
-
-model User {
-  id             Int           @id @default(autoincrement())
-  telegramId     BigInt        @unique
-  telegramUsername String?
-  empId          Int?
-  fullName       String
-  phoneNumber    String?
-  position       String
-  department     String
-  createdAt      DateTime      @default(now())
-  lastVerifiedAt DateTime?
-  employee       EmployeeRef?  @relation(fields: [empId], references: [id])
-  inviteLinks    InviteLink[]
-}
-
-model InviteLink {
-  id           Int           @id @default(autoincrement())
-  telegramId   BigInt
-  url          String        @unique
-  inviteLinkId String?
-  channelId    String        @default("")
-  expiresAt    DateTime
-  ttlSeconds   Int
-  status       String        @default("ACTIVE")
-  createdAt    DateTime      @default(now())
-  usedAt       DateTime?
-  user         User          @relation(fields: [telegramId], references: [telegramId])
-
-  @@index([telegramId, status, expiresAt])
-}
-
-model DepartmentChannel {
-  id         Int    @id @default(autoincrement())
-  department String @unique
-  channelId  String
-}
-
-model AuditLog {
-  id          Int      @id @default(autoincrement())
-  telegramId  BigInt
-  action      String
-  payloadJson String
-  createdAt   DateTime @default(now())
-
-  @@index([telegramId, action])
-}
-
-model Admin {
-  id          Int      @id @default(autoincrement())
-  telegramId  BigInt   @unique
-  createdAt   DateTime @default(now())
-}
 
