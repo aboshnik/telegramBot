@@ -23,7 +23,7 @@ async function cleanupExpiredInvites() {
     if (err.code === 'P2021') {
       console.log("InviteLink table does not exist, skipping cleanup");
     } else {
-      console.error("Invite cleanup failed", err);
+    console.error("Invite cleanup failed", err);
     }
   }
 }
@@ -54,6 +54,87 @@ async function processFiredAndBlacklisted() {
   if (!isWithinMoscowNightWindow(now)) return;
 
   try {
+    // Проверяем LexemaCard: всех пользователей без даты увольнения - разбаниваем в каналах
+    // Это нужно, чтобы разбанить пользователей, которые забанены в канале, но не уволены
+    const activeEmployees = await prisma.lexemaCard.findMany({
+      where: {
+        terminationDate: null, // Нет даты увольнения = работает
+        telegramId: { not: null },
+      },
+    });
+
+    const newsChannelId = await getNewsChannelIdForCron();
+
+    for (const emp of activeEmployees) {
+      const tgId = Number(emp.telegramId);
+      
+      // Если в черном списке - убираем из ЧС в БД
+      if (emp.blacklisted) {
+        try {
+          await prisma.$executeRaw`
+            UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
+            SET ЧерныйСписок = 0 
+            WHERE VCode = ${emp.code}
+          `;
+        } catch (err) {
+          console.error("Night check: failed to remove from blacklist", err);
+        }
+      }
+
+      // Разбаниваем в каналах (независимо от статуса blacklisted в БД)
+      // Это разбанит пользователей, которые забанены в канале, но не уволены
+      try {
+        // Пытаемся найти канал по departmentId
+        const mapping = await prismaMeta.departmentChannel.findFirst({
+          where: { department: String(emp.departmentId || "") },
+        });
+        const deptChannelId = mapping?.channelId || config.channelId || null;
+        if (deptChannelId) {
+          try {
+            await bot.telegram.unbanChatMember(deptChannelId, tgId, { only_if_banned: true });
+          } catch (unbanErr) {
+            if (!unbanErr?.response?.description?.includes("not found") && 
+                !unbanErr?.response?.description?.includes("not in the chat")) {
+              console.log("Night check: cannot unban from department channel:", unbanErr.response?.description);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Night check: failed to unban from department channel", err);
+      }
+
+      // Новостной канал
+      if (newsChannelId) {
+        try {
+          await bot.telegram.unbanChatMember(newsChannelId, tgId, { only_if_banned: true });
+        } catch (unbanErr) {
+          if (!unbanErr?.response?.description?.includes("not found") && 
+              !unbanErr?.response?.description?.includes("not in the chat")) {
+            console.log("Night check: cannot unban from news channel:", unbanErr.response?.description);
+          }
+        }
+      }
+
+      // Логируем только если был в черном списке
+      if (emp.blacklisted) {
+        try {
+          await prismaMeta.auditLog.create({
+            data: {
+              telegramId: BigInt(emp.telegramId),
+              action: "night_auto_unblacklist",
+              payloadJson: JSON.stringify({
+                code: emp.code,
+                reason: "terminationDate is null",
+              }),
+            },
+          });
+        } catch (err) {
+          console.error("Night check: failed to write audit log", err);
+        }
+      }
+    }
+
+    // Обрабатываем EmployeeRef (старая логика для совместимости)
     const employees = await prismaMeta.employeeRef.findMany({
       where: {
         OR: [{ fired: true }, { blacklisted: true }],
@@ -62,8 +143,6 @@ async function processFiredAndBlacklisted() {
     });
 
     if (!employees.length) return;
-
-    const newsChannelId = await getNewsChannelIdForCron();
 
     for (const emp of employees) {
       const tgId = Number(emp.telegramId);

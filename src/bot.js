@@ -92,6 +92,48 @@ export function createBot() {
     );
   });
 
+  bot.command("help", async (ctx) => {
+    if (!isPrivate(ctx)) return;
+    
+    const isOwnerUser = isOwner(ctx);
+    const isAdminUser = await hasAdminAccess(ctx);
+    
+    let helpText = "📋 Доступные команды:\n\n";
+    
+    // Команды для всех пользователей
+    helpText += "👤 Для всех пользователей:\n";
+    helpText += "/start - Начать регистрацию\n";
+    helpText += "/reset - Сбросить состояние регистрации\n";
+    helpText += "/help - Показать эту справку\n\n";
+    
+    // Команды для администраторов
+    if (isAdminUser) {
+      helpText += "🔧 Команды администратора:\n";
+      helpText += "/test_data - Проверить данные сотрудника\n";
+      helpText += "/user_status <id|@username> - Статус пользователя в канале отдела\n";
+      helpText += "/check_hist [id|@username] - История действий (последние 10 записей)\n";
+      helpText += "/news <текст> - Отправить новость в новостной канал\n";
+      helpText += "/remove_user <id|@username> <причина> - Забанить пользователя в канале отдела\n";
+      helpText += "/bind_department <Отдел> - Привязать канал к отделу (выполнить в канале)\n\n";
+    }
+    
+    // Команды только для владельца
+    if (isOwnerUser) {
+      helpText += "👑 Команды владельца:\n";
+      helpText += "/add_admin <id|@username> - Добавить администратора\n";
+      helpText += "/unadd_admin <id|@username> - Удалить администратора\n";
+      helpText += "/list_employees - Список всех сотрудников\n";
+      helpText += "/set_admin_log_chat - Установить чат для логов админов (выполнить в чате)\n";
+      helpText += "/set_news_channel - Установить новостной канал (выполнить в канале)\n";
+      helpText += "/check_fired - Проверить уволенных сотрудников\n";
+      helpText += "/test_unban - Тест разбана работающих сотрудников (в removed users)\n";
+      helpText += "/unbind_all - Отвязать все каналы от отделов\n";
+      helpText += "/bind_department <Отдел> - Привязать/изменить канал к отделу (выполнить в канале)\n";
+    }
+    
+    await ctx.reply(helpText);
+  });
+
   bot.command("reset", async (ctx) => {
     if (!isPrivate(ctx)) return;
     
@@ -516,7 +558,7 @@ export function createBot() {
     });
 
     newsChannelIdCache = String(targetChannelId);
-    await ctx.reply(`Новостной канал установлен: ${targetChannelId}`);
+    await ctx.reply(`Новостной(внутренний) канал установлен: ${targetChannelId}`);
   });
 
   // Временная команда для ручной проверки БД и кика уволенных/в ЧС
@@ -527,59 +569,97 @@ export function createBot() {
     }
 
     try {
-      const employees = await prismaMeta.employeeRef.findMany({
+      // Проверяем LexemaCard: ищем сотрудников с датой увольнения (terminationDate не NULL)
+      const firedEmployees = await prisma.lexemaCard.findMany({
         where: {
-          OR: [{ fired: true }, { blacklisted: true }],
+          terminationDate: { not: null },
           telegramId: { not: null },
         },
       });
 
-      if (!employees.length) {
-        await ctx.reply("Нет сотрудников со статусом 'уволен' или в чёрном списке.");
+      if (!firedEmployees.length) {
+        await ctx.reply("Нет сотрудников с датой увольнения (все сотрудники работают).");
         return;
       }
 
       const newsChannelId = await getNewsChannelId();
       let processed = 0;
+      let banned = 0;
+      let errors = 0;
 
-      for (const emp of employees) {
+      let report = `Найдено уволенных сотрудников: ${firedEmployees.length}\n\n`;
+
+      for (const emp of firedEmployees) {
         const tgId = Number(emp.telegramId);
+        const fullName = `${emp.lastName || ""} ${emp.firstName || ""} ${emp.middleName || ""}`.trim() || `Код: ${emp.code}`;
+        const terminationDate = emp.terminationDate ? new Date(emp.terminationDate).toLocaleDateString('ru-RU') : "не указана";
 
         // Канал отдела
+        let deptBanned = false;
         try {
-          const channelId = await resolveChannelId(emp.department);
-          await ctx.telegram.banChatMember(channelId, tgId);
+          const channelId = await resolveChannelId(String(emp.departmentId || ""));
+          if (channelId) {
+            await ctx.telegram.banChatMember(channelId, tgId);
+            deptBanned = true;
+          }
         } catch (err) {
-          console.error("check_fired: failed to ban from department channel", err);
-        }
-
-        // Новостной канал
-        if (newsChannelId) {
-          try {
-            await ctx.telegram.banChatMember(newsChannelId, tgId);
-          } catch (err) {
-            console.error("check_fired: failed to ban from news channel", err);
+          if (!err?.response?.description?.includes("not found") && 
+              !err?.response?.description?.includes("not in the chat") &&
+              !err?.response?.description?.includes("chat owner")) {
+            console.error(`check_fired: failed to ban ${fullName} from department channel`, err);
+            errors++;
           }
         }
 
-        try {
-          await prismaMeta.employeeRef.update({
-            where: { id: emp.id },
-            data: { blacklisted: true },
-          });
-        } catch (err) {
-          console.error("check_fired: failed to mark blacklisted", err);
+        // Новостной(внутренний) канал
+        let newsBanned = false;
+        if (newsChannelId) {
+          try {
+            await ctx.telegram.banChatMember(newsChannelId, tgId);
+            newsBanned = true;
+          } catch (err) {
+            if (!err?.response?.description?.includes("not found") && 
+                !err?.response?.description?.includes("not in the chat") &&
+                !err?.response?.description?.includes("chat owner")) {
+              console.error(`check_fired: failed to ban ${fullName} from news channel`, err);
+              errors++;
+            }
+          }
         }
+
+        // Устанавливаем черный список, если еще не установлен
+        if (!emp.blacklisted) {
+          try {
+            await prisma.$executeRaw`
+              UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
+              SET ЧерныйСписок = 1 
+              WHERE VCode = ${emp.code}
+            `;
+          } catch (err) {
+            console.error(`check_fired: failed to mark blacklisted for ${fullName}`, err);
+          }
+        }
+
+        if (deptBanned || newsBanned) {
+          banned++;
+        }
+
+        report += `${fullName} (ID: ${tgId})\n`;
+        report += `  Дата увольнения: ${terminationDate}\n`;
+        report += `  Забанен в канале отдела: ${deptBanned ? "да" : "нет"}\n`;
+        report += `  Забанен в новостном канале: ${newsBanned ? "да" : "нет"}\n\n`;
 
         try {
           await prismaMeta.auditLog.create({
             data: {
-              telegramId: BigInt(emp.telegramId),
+              telegramId: BigInt(tgId),
               action: "manual_check_block",
               payloadJson: JSON.stringify({
-                empId: emp.id,
-                fired: emp.fired,
-                blacklisted: emp.blacklisted,
+                code: emp.code,
+                fullName: fullName,
+                terminationDate: terminationDate,
+                deptBanned: deptBanned,
+                newsBanned: newsBanned,
               }),
             },
           });
@@ -587,13 +667,138 @@ export function createBot() {
           console.error("check_fired: failed to write audit log", err);
         }
 
-        processed += 1;
+        processed++;
       }
 
-      await ctx.reply(`Проверка завершена. Обработано сотрудников: ${processed}.`);
+      report += `\nОбработано: ${processed}\n`;
+      report += `Забанено: ${banned}\n`;
+      if (errors > 0) {
+        report += `Ошибок: ${errors}\n`;
+      }
+
+      await ctx.reply(report);
     } catch (err) {
       console.error("check_fired failed", err);
-      await ctx.reply("Не удалось выполнить проверку. Попробуй позже.");
+      await ctx.reply("Ошибка при проверке уволенных сотрудников: " + err.message);
+    }
+  });
+
+  // Тестовая команда для проверки разбана пользователей без даты увольнения
+  bot.command("test_unban", async (ctx) => {
+    if (!isOwner(ctx)) {
+      await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
+      return;
+    }
+
+    try {
+      // Ищем всех пользователей без даты увольнения (работающих)
+      // Используем raw query для корректной обработки BIT поля ЧерныйСписок
+      const activeEmployeesRaw = await prisma.$queryRaw`
+        SELECT 
+          VCode as code,
+          Фамилия as lastName,
+          Имя as firstName,
+          Отчество as middleName,
+          Подразделение as departmentId,
+          Должность as positionId,
+          ДатаУвольнения as terminationDate,
+          Сотовый as phone,
+          ТелеграмЮзернейм as telegramUsername,
+          ТелеграмID as telegramId,
+          CAST(ЧерныйСписок AS INT) as blacklisted
+        FROM [Лексема_Кадры_ЛичнаяКарточка]
+        WHERE ДатаУвольнения IS NULL 
+          AND ТелеграмID IS NOT NULL
+      `;
+
+      // Преобразуем результаты
+      const activeEmployees = activeEmployeesRaw.map(emp => ({
+        ...emp,
+        blacklisted: emp.blacklisted === 1 || emp.blacklisted === true,
+        telegramId: emp.telegramId ? BigInt(emp.telegramId) : null,
+      }));
+
+      if (!activeEmployees.length) {
+        await ctx.reply("Нет сотрудников без даты увольнения (все уволены или нет telegramId).");
+        return;
+      }
+
+      const newsChannelId = await getNewsChannelId();
+      let processed = 0;
+      let unbannedNews = 0;
+      let errors = 0;
+
+      let report = `🔍 Тест разбана для работающих сотрудников\n\n`;
+      report += `Найдено сотрудников без даты увольнения: ${activeEmployees.length}\n\n`;
+
+      for (const emp of activeEmployees) {
+        const tgId = Number(emp.telegramId);
+        const fullName = `${emp.lastName || ""} ${emp.firstName || ""} ${emp.middleName || ""}`.trim() || `Код: ${emp.code}`;
+        const wasBlacklisted = emp.blacklisted;
+
+        let newsUnbanned = false;
+
+        // Новостной канал
+        if (newsChannelId) {
+          try {
+            await ctx.telegram.unbanChatMember(newsChannelId, tgId, { only_if_banned: true });
+            newsUnbanned = true;
+            unbannedNews++;
+          } catch (unbanErr) {
+            if (unbanErr?.response?.description?.includes("not found") || 
+                unbanErr?.response?.description?.includes("not in the chat") ||
+                unbanErr?.response?.description?.includes("not enough rights")) {
+              // Игнорируем эти ошибки
+            } else {
+              console.log(`test_unban: cannot unban ${fullName} from news channel:`, unbanErr.response?.description);
+              errors++;
+            }
+          }
+        }
+
+        // Убираем из черного списка, если был в ЧС
+        if (wasBlacklisted) {
+          try {
+            await prisma.$executeRaw`
+              UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
+              SET ЧерныйСписок = 0 
+              WHERE VCode = ${emp.code}
+            `;
+          } catch (err) {
+            console.error(`test_unban: failed to remove from blacklist for ${fullName}`, err);
+          }
+        }
+
+        // Добавляем в отчет только если был разбанен или был в ЧС
+        if (newsUnbanned || wasBlacklisted) {
+          report += `${fullName} (ID: ${tgId})\n`;
+          if (wasBlacklisted) {
+            report += `  ✅ Убран из черного списка в БД\n`;
+          }
+          if (newsChannelId) {
+            if (newsUnbanned) {
+              report += `  ✅ Разбанен в новостном канале\n`;
+            } else {
+              report += `  ⚪ Не был забанен в новостном канале\n`;
+            }
+          }
+          report += `\n`;
+        }
+
+        processed++;
+      }
+
+      report += `\n📊 Статистика:\n`;
+      report += `Обработано: ${processed}\n`;
+      report += `Разбанено в новостном канале: ${unbannedNews}\n`;
+      if (errors > 0) {
+        report += `Ошибок: ${errors}\n`;
+      }
+
+      await ctx.reply(report);
+    } catch (err) {
+      console.error("test_unban failed", err);
+      await ctx.reply("Ошибка при тестировании разбана: " + err.message);
     }
   });
 
@@ -799,19 +1004,8 @@ export function createBot() {
 
         case "waiting_middleName":
           userState.data.middleName = text.trim() === "-" ? null : text.trim();
-          userState.step = "waiting_positionId";
-          await ctx.reply("4. Должность (ID - число)");
-          break;
-
-        case "waiting_positionId":
-          const positionId = parseInt(text.trim());
-          if (isNaN(positionId)) {
-            await ctx.reply("Пожалуйста, введите корректный ID должности (число).");
-            return;
-          }
-          userState.data.positionId = positionId;
           userState.step = "waiting_departmentId";
-          await ctx.reply("5. Подразделение (ID - число)");
+          await ctx.reply("4. Подразделение (ID - число)");
           break;
 
         case "waiting_departmentId":
@@ -821,6 +1015,17 @@ export function createBot() {
             return;
           }
           userState.data.departmentId = departmentId;
+          userState.step = "waiting_positionId";
+          await ctx.reply("5. Должность (ID - число)");
+          break;
+
+        case "waiting_positionId":
+          const positionId = parseInt(text.trim());
+          if (isNaN(positionId)) {
+            await ctx.reply("Пожалуйста, введите корректный ID должности (число).");
+            return;
+          }
+          userState.data.positionId = positionId;
           userState.step = "waiting_phone";
           await ctx.reply("6. Номер телефона");
           break;
@@ -1006,8 +1211,8 @@ async function showDataConfirmation(ctx, data) {
     `👤 Фамилия: ${data.lastName || "не указано"}\n` +
     `👤 Имя: ${data.firstName || "не указано"}\n` +
     `👤 Отчество: ${data.middleName || "не указано"}\n` +
-    `💼 Должность (ID): ${data.positionId || "не указано"}\n` +
     `🏢 Подразделение (ID): ${data.departmentId || "не указано"}\n` +
+    `💼 Должность (ID): ${data.positionId || "не указано"}\n` +
     `📞 Телефон: ${formattedPhone}`;
 
   const keyboard = Markup.inlineKeyboard([
@@ -1027,10 +1232,10 @@ async function showEditMenu(ctx) {
     ],
     [
       Markup.button.callback("👤 Отчество", "change_middleName"),
-      Markup.button.callback("💼 Должность", "change_positionId"),
+      Markup.button.callback("🏢 Подразделение", "change_departmentId"),
     ],
     [
-      Markup.button.callback("🏢 Подразделение", "change_departmentId"),
+      Markup.button.callback("💼 Должность", "change_positionId"),
       Markup.button.callback("📞 Телефон", "change_phone"),
     ],
   ]);
@@ -1100,7 +1305,7 @@ async function handleNewsCommand(ctx) {
   const newsChannelId = await getNewsChannelId();
   if (!newsChannelId) {
     await ctx.reply(
-      "Новостной канал не настроен. Используй /set_news_channel в нужном канале или задай NEWS_CHANNEL_ID в .env."
+      "Новостной(внутренний) канал не настроен. Используй /set_news_channel в нужном канале или задай NEWS_CHANNEL_ID в .env."
     );
     return;
   }
@@ -1140,7 +1345,7 @@ async function handleNewsCommand(ctx) {
         parse_mode: "HTML",
       });
     }
-    await ctx.reply("Новость отправлена в новостной канал.");
+    await ctx.reply("Новость отправлена в новостной(внутренний) канал.");
   } catch (err) {
     console.error(err);
     await ctx.reply(
@@ -1328,8 +1533,75 @@ async function handleVerificationAndLink(ctx, form) {
     return;
   }
 
-  // Блокируем уволенных или уже в чёрном списке
-  if (employee.blacklisted) {
+  // Проверяем: если не уволен (нет даты увольнения) - разбаниваем в каналах и убираем из ЧС
+  if (!employee.terminationDate) {
+    // Если в черном списке - убираем из ЧС в БД
+    if (employee.blacklisted) {
+      try {
+        await prisma.$executeRaw`
+          UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
+          SET ЧерныйСписок = 0 
+          WHERE VCode = ${employee.code}
+        `;
+      } catch (err) {
+        console.error("Failed to remove from blacklist", err);
+      }
+    }
+
+    // Разбаниваем в каналах, если есть telegramId (независимо от статуса blacklisted в БД)
+    // Это нужно, чтобы разбанить пользователей, которые забанены в канале, но не в черном списке в БД
+    if (employee.telegramId) {
+      try {
+        const channelId = await resolveChannelId(String(employee.departmentId || ""));
+        if (channelId && (channelId.startsWith("-") || channelId.startsWith("@"))) {
+          try {
+            await ctx.telegram.unbanChatMember(channelId, Number(employee.telegramId), { only_if_banned: true });
+          } catch (unbanErr) {
+            // Игнорируем ошибки, если пользователь не забанен
+            if (!unbanErr?.response?.description?.includes("not found") && 
+                !unbanErr?.response?.description?.includes("not in the chat")) {
+              console.log("Cannot unban user:", unbanErr.response?.description);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Failed to unban from department channel", err);
+      }
+
+      try {
+        const newsChannelId = await getNewsChannelId();
+        if (newsChannelId) {
+          try {
+            await ctx.telegram.unbanChatMember(newsChannelId, Number(employee.telegramId), { only_if_banned: true });
+          } catch (unbanErr) {
+            if (!unbanErr?.response?.description?.includes("not found") && 
+                !unbanErr?.response?.description?.includes("not in the chat")) {
+              console.log("Cannot unban user from news channel:", unbanErr.response?.description);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Failed to unban from news channel", err);
+      }
+    }
+
+    // Логируем только если был в черном списке
+    if (employee.blacklisted) {
+      await prismaMeta.auditLog.create({
+        data: {
+          telegramId: BigInt(telegramId),
+          action: "blacklist_removed",
+          payloadJson: JSON.stringify({ code: employee.code, reason: "terminationDate is null" }),
+        },
+      });
+    }
+
+    // Обновляем employee объект для дальнейшей обработки
+    employee.blacklisted = false;
+  }
+
+  // Блокируем только если действительно в черном списке И уволен
+  if (employee.blacklisted && employee.terminationDate) {
     await prismaMeta.auditLog.create({
       data: {
         telegramId: BigInt(telegramId),
@@ -1350,7 +1622,7 @@ async function handleVerificationAndLink(ctx, form) {
       // Проверяем, что это канал (начинается с - или @), а не private chat
       if (channelId && (channelId.startsWith("-") || channelId.startsWith("@"))) {
         try {
-          await ctx.telegram.banChatMember(channelId, Number(telegramId));
+      await ctx.telegram.banChatMember(channelId, Number(telegramId));
         } catch (banErr) {
           // Игнорируем ошибки "can't ban members in private chats" и "can't remove chat owner"
           if (banErr?.response?.description?.includes("private chats") || 
@@ -1368,7 +1640,7 @@ async function handleVerificationAndLink(ctx, form) {
         // Это нормально, просто логируем
         console.log("Cannot ban user (private chat or owner):", err.response?.description);
       } else {
-        console.error("Failed to ban from department channel for fired user", err);
+      console.error("Failed to ban from department channel for fired user", err);
       }
     }
 
@@ -1384,14 +1656,15 @@ async function handleVerificationAndLink(ctx, form) {
         // Это нормально, просто логируем
         console.log("Cannot ban user (private chat or owner):", err.response?.description);
       } else {
-        console.error("Failed to ban from news channel for fired user", err);
-      }
+      console.error("Failed to ban from news channel for fired user", err);
+    }
     }
 
     try {
       // Используем raw query для обновления BIT поля в SQL Server
+      // Используем русское название таблицы
       await prisma.$executeRaw`
-        UPDATE Lexema_Kadry_LichnayaKartochka 
+        UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
         SET ЧерныйСписок = 1 
         WHERE VCode = ${employee.code}
       `;
@@ -1457,12 +1730,12 @@ async function handleVerificationAndLink(ctx, form) {
   const fullName = fullNameParts.length > 0 ? fullNameParts.join(" ") : "Не указано";
 
     await prismaMeta.auditLog.create({
-      data: {
-        telegramId: BigInt(telegramId),
-        action: "verification_success",
+    data: {
+      telegramId: BigInt(telegramId),
+      action: "verification_success",
         payloadJson: JSON.stringify({ ...form, code: employee.code }),
-      },
-    });
+    },
+  });
 
   // Привязываем telegramId к записи сотрудника, если ещё не привязано
   if (!employee.telegramId || !employee.telegramUsername) {
@@ -1522,79 +1795,83 @@ async function handleVerificationAndLink(ctx, form) {
     },
   });
 
-  let invite;
+  // Создание инвайт-ссылки для новостного канала
   let newsInvite = null;
   try {
     const newsChannelId = await getNewsChannelId();
-
-    invite = await getOrCreateInviteLink({
-      telegram: ctx.telegram,
-      prisma,
-      telegramId,
-      fullName: user.fullName,
-      channelId: await resolveChannelId(String(form.departmentId || "")),
-    });
     if (newsChannelId) {
       newsInvite = await getOrCreateInviteLink({
         telegram: ctx.telegram,
-        prisma,
+        prisma: prismaMeta,
         telegramId,
         fullName: user.fullName,
         channelId: newsChannelId,
       });
+
+      if (newsInvite) {
+        await prismaMeta.auditLog.create({
+          data: {
+            telegramId: BigInt(telegramId),
+            action: "news_invite_issued",
+            payloadJson: JSON.stringify({
+              inviteLinkId: newsInvite.inviteLinkId,
+              expiresAt: newsInvite.expiresAt,
+              channelId: newsInvite.channelId,
+            }),
+          },
+        });
+      }
     }
   } catch (err) {
-    console.error(err);
-    if (
-      err?.response?.description?.includes("chat not found") ||
-      err?.on?.payload?.chat_id
-    ) {
-      await ctx.reply(
-        "Не удалось сгенерировать ссылку: чат отдела не найден или бот не админ. Сообщи администратору."
-      );
-    } else {
-      await ctx.reply(
-        "Ошибка при создании ссылки. Попробуй позже или сообщи администратору."
-      );
-    }
-    return;
+    console.error("Failed to create news channel invite link", err);
+    // Не прерываем регистрацию, если не удалось создать ссылку
   }
 
-  await prismaMeta.auditLog.create({
-    data: {
-      telegramId: BigInt(telegramId),
-      action: "invite_issued",
-      payloadJson: JSON.stringify({
-        inviteLinkId: invite.inviteLinkId,
-        expiresAt: invite.expiresAt,
-        channelId: invite.channelId,
-      }),
-    },
-  });
-
-  if (newsInvite) {
-    await prismaMeta.auditLog.create({
-      data: {
-        telegramId: BigInt(telegramId),
-        action: "news_invite_issued",
-        payloadJson: JSON.stringify({
-          inviteLinkId: newsInvite.inviteLinkId,
-          expiresAt: newsInvite.expiresAt,
-          channelId: newsInvite.channelId,
-        }),
-      },
-    });
-  }
-
-  const expiresAtText = formatISO9075(invite.expiresAt);
-  let reply = `Твоя персональная ссылка в канал отдела:\n${invite.url}\nДействует до: ${expiresAtText}`;
-
+  // Сообщение об успешной регистрации с ссылкой на общедоступный канал
+  const publicChannelLink = "https://t.me/salstek";
+  let reply = "Регистрация успешно завершена! Твои данные сохранены.\n\n";
+  reply += `📢 Общедоступный канал:\n${publicChannelLink}`;
+  
+  // Добавляем инвайт-ссылку на новостной канал, если она была создана
   if (newsInvite) {
     const newsExpiresAtText = formatISO9075(newsInvite.expiresAt);
-    reply += `\n\nТвоя персональная ссылка в новостной канал:\n${newsInvite.url}\nДействует до: ${newsExpiresAtText}`;
+    reply += `\n\n📰 Новостной(внутренний) канал:\n${newsInvite.url}\nДействует до: ${newsExpiresAtText}`;
+  } else {
+    // Если ссылка не была создана, пытаемся показать публичную ссылку или ID
+    try {
+      const newsChannelId = await getNewsChannelId();
+      if (newsChannelId) {
+        let newsChannelLink = newsChannelId;
+        if (newsChannelId.startsWith("@")) {
+          newsChannelLink = `https://t.me/${newsChannelId.slice(1)}`;
+        } else if (newsChannelId.startsWith("-")) {
+          // Для числовых ID каналов пытаемся получить username через API
+          try {
+            const chatInfo = await ctx.telegram.getChat(newsChannelId);
+            if (chatInfo?.username) {
+              newsChannelLink = `https://t.me/${chatInfo.username}`;
+            } else {
+              // Если username нет, показываем, что это приватный канал
+              newsChannelLink = `Приватный канал (ID: ${newsChannelId})`;
+            }
+          } catch (chatErr) {
+            // Если не удалось получить информацию, показываем ID
+            newsChannelLink = `Канал (ID: ${newsChannelId})`;
+          }
+        } else {
+          // Если это просто username без @
+          newsChannelLink = `https://t.me/${newsChannelId}`;
+        }
+        reply += `\n\n📰 Новостной(внутренний) канал: ${newsChannelLink}`;
+      }
+    } catch (err) {
+      console.error("Failed to get news channel ID", err);
+    }
   }
 
-  reply += `\n\nЕсли ссылка истечет или будет использована — запусти /start ещё раз.`;
+  if (newsInvite) {
+    reply += `\n\nЕсли ссылка истечет или будет использована — запусти /start ещё раз.`;
+  }
 
   await ctx.reply(reply);
 }

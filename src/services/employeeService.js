@@ -73,7 +73,7 @@ export async function findEmployee(prisma, { lastName, firstName, middleName, po
         // Возвращаем как есть
         return digits;
       };
-      
+
       const userNorm = normalizeForCompare(userDigits);
       const dbNorm = normalizeForCompare(dbDigits);
       

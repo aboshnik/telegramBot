@@ -7,20 +7,41 @@ datasource db {
   url      = env("DB_URL")
 }
 
+// Модель для таблицы сотрудников из SQL Server
+// Таблица может называться на русском: "Лексема_Кадры_ЛичнаяКарточка" 
+// или на английском: "Lexema_Kadry_LichnayaKartochka"
+// Prisma автоматически экранирует кириллицу через квадратные скобки в SQL Server: [Лексема_Кадры_ЛичнаяКарточка]
+// 
+// ИНСТРУКЦИЯ ПО СМЕНЕ НАЗВАНИЯ ТАБЛИЦЫ:
+// Если таблица в базе данных называется на русском, измените строку @@map на:
+//   @@map("Лексема_Кадры_ЛичнаяКарточка")
+// Если таблица называется на английском (текущий вариант), оставьте как есть:
+//   @@map("Lexema_Kadry_LichnayaKartochka")
 model LexemaCard {
-  code              Int       @id @map("VCode")
-  lastName          String?   @map("Фамилия")
-  firstName         String?   @map("Имя")
-  middleName        String?   @map("Отчество")
-  departmentId      Int?      @map("Подразделение")
-  positionId        Int?      @map("Должность")
-  terminationDate   DateTime? @map("ДатаУвольнения")
-  phone             String?   @map("Сотовый")
-  telegramUsername  String?   @map("ТелеграмЮзернейм")
-  telegramId        BigInt?   @map("ТелеграмID")
-  blacklisted       Boolean?  @default(false) @map("ЧерныйСписок") @db.Bit
+  code              Int       @id @map("VCode") // VCode / Код
+  lastName          String?   @map("Фамилия") // Фамилия
+  firstName         String?   @map("Имя") // Имя
+  middleName        String?   @map("Отчество") // Отчество
+  departmentId      Int?      @map("Подразделение") // Подразделение / DepartmentId
+  positionId        Int?      @map("Должность") // Должность / PositionId
+  terminationDate   DateTime? @map("ДатаУвольнения") // ДатаУвольнения / TerminationDate
+  phone             String?   @map("Сотовый") // Сотовый / Phone
+  telegramUsername  String?   @map("ТелеграмЮзернейм") // ТелеграмЮзернейм / TelegramUsername
+  telegramId        BigInt?   @map("ТелеграмID") // ТелеграмID / TelegramId
+  blacklisted       Boolean?  @default(false) @map("ЧерныйСписок") @db.Bit // ЧерныйСписок / Blacklisted
 
-  @@map("Lexema_Kadry_LichnayaKartochka")
+  // АВТОМАТИЧЕСКАЯ ПОДДЕРЖКА ОБОИХ НАЗВАНИЙ:
+  // Обертка lexemaCard в src/db.js автоматически определяет правильное название таблицы
+  // При первом обращении проверяются оба варианта: русское и английское
+  // 
+  // Текущий вариант в схеме (обновлено на русское название, т.к. таблица в БД называется на русском):
+  @@map("Лексема_Кадры_ЛичнаяКарточка") // Русское название
+  // Альтернативный вариант (если таблица называется на английском, раскомментируйте и закомментируйте строку выше):
+  // @@map("Lexema_Kadry_LichnayaKartochka") // Английское название
+  //
+  // ВАЖНО: Если таблица называется на русском, измените @@map выше на русское название
+  // и выполните: npm run prisma:generate
+  // Обертка lexemaCard автоматически определит правильное название при первом запросе
 }
 
 
