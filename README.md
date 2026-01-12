@@ -1,41 +1,15 @@
 # Telegram Bot для кадров
 
-## Что умеет
-- Пошаговая регистрация сотрудника: ФИО → телефон → должность → отдел.
-- Проверка данных в таблице `Лексема_Кадры_ЛичнаяКарточка` (SQL Server).
-- Генерация персональных инвайт-ссылок в новостной канал с TTL.
-- Авто-управление черным списком: разбан работающих, бан уволенных.
-- Ночная проверка статусов (00:00–05:00 МСК).
-- Отдельная meta-БД (SQLite) для каналов отделов, админов, логов.
-- Логи действий админов в meta-БД и в выбранный чат.
-- Готов к установке на сервер завода (Windows/Linux).
+## Возможности
+- Регистрация: ФИО → телефон → должность → отдел.
+- Проверка сотрудников в таблице SQL Server `Lexema_Кадры_ЛичнаяКарточка` (или `Lexema_Kadry_LichnayaKartochka`).
+- Персональные инвайт-ссылки в новостной канал с TTL.
+- Авто-ЧС: разбан работающих, бан уволенных.
+- Ночная проверка статусов (00:00–05:00 МСК) с логами в admin log chat и meta-БД.
+- Отдельная meta-БД (SQLite) для каналов, админов, логов.
+- Деплой на Windows/Linux, работа 24/7 через PM2.
 
-## Быстрый старт (локально)
-1) Скопируй `env.example` в `.env` и заполни:
-```
-BOT_TOKEN=...
-CHANNEL_ID=@fallback_channel
-NEWS_CHANNEL_ID=@news_channel
-DB_URL="Driver={ODBC Driver 17 for SQL Server};Server=...;Database=...;Uid=...;Pwd=...;TrustServerCertificate=yes;"
-META_DB_URL="file:./prisma/meta.db"
-LINK_TTL_HOURS=24
-OWNER_ID=твой_telegram_id
-ADMIN_LOG_CHAT_ID=...   # можно задать командой
-NODE_ENV=production
-```
-2) Установи зависимости: `npm install`  
-3) Сгенерируй Prisma клиенты:
-```
-npm run prisma:generate
-npm run prisma:generate:meta
-```
-4) Инициализируй meta-БД: `npm run prisma:push:meta`  
-5) Запуск: `npm start`
-
-## Подготовка БД (SQL Server)
-Таблица: `Лексема_Кадры_ЛичнаяКарточка` (или `Lexema_Kadry_LichnayaKartochka`).
-
-Обязательные поля:
+## Таблица в SQL Server (обязательные поля)
 - `VCode` (PK, int)
 - `Фамилия`, `Имя`, `Отчество` (nvarchar)
 - `Подразделение` (int)
@@ -44,75 +18,60 @@ npm run prisma:generate:meta
 - `ДатаУвольнения` (datetime, NULL если работает)
 - `ТелеграмID` (bigint, NULL)
 - `ТелеграмЮзернейм` (nvarchar, NULL)
-- `ЧерныйСписок` (bit, по умолчанию 0)
+- `ЧерныйСписок` (bit, default 0)
 
-Логика:
-- `ДатаУвольнения = NULL` → считается работающим; если `ЧерныйСписок = 1`, бот снимет из ЧС.
-- `ДатаУвольнения != NULL` → считается уволенным; бот занесет в ЧС и забанит в каналах.
+Логика:  
+`ДатаУвольнения = NULL` → работает; если `ЧерныйСписок = 1`, бот снимет из ЧС.  
+`ДатаУвольнения != NULL` → уволен; бот занесёт в ЧС и забанит в каналах.
 
-## Запуск на сервере
-### Windows Server
-- Установи Node.js 20+ (с сайта или `choco install nodejs`).
-- Поставь ODBC Driver 17 для SQL Server.
-- `npm install`
-- `npm run prisma:generate && npm run prisma:generate:meta`
-- `npm run prisma:push:meta`
-- `npm start`
+## Настройка .env
+Скопируй `env.example` в `.env` и заполни:
+```
+BOT_TOKEN=...
+CHANNEL_ID=@fallback_channel
+DB_URL="sqlserver://localhost:1433;database=lktest;user=EmployeAdmin;password=123456;encrypt=true;trustServerCertificate=true"
+META_DB_URL="file:./prisma/meta.db"
+LINK_TTL_HOURS=24
+OWNER_ID=твой_telegram_id
+ADMIN_LOG_CHAT_ID=...   # можно задать командой /set_admin_log_chat
+NODE_ENV=production
+```
 
-### Linux (Ubuntu/Debian)
-- Node.js 20+:  
-  `curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -`  
-  `sudo apt install -y nodejs`
-- ODBC Driver 17: добавить репозиторий Microsoft, затем `sudo ACCEPT_EULA=Y apt-get install -y msodbcsql17`
-- `npm install`
-- `npm run prisma:generate && npm run prisma:generate:meta`
-- `npm run prisma:push:meta`
-- `npm start`
+## Установка и Prisma
+```
+npm install
+npm run prisma:generate
+npm run prisma:generate:meta
+npm run prisma:push:meta   # инициализация meta-БД (SQLite)
+```
 
-### Работа 24/7 через PM2
+## Запуск
+```
+npm start
+```
+
+## Работа 24/7 (PM2)
 ```
 npm install -g pm2
 pm2 start src/index.js --name telegram-bot
 pm2 save
 pm2 startup   # выполнить команду, которую покажет PM2
 ```
-Полезное:
-- `pm2 list`
-- `pm2 logs telegram-bot`
-- `pm2 restart/stop/delete telegram-bot`
-- `pm2 monit`
+Полезное: `pm2 list`, `pm2 logs telegram-bot`, `pm2 restart telegram-bot`, `pm2 stop telegram-bot`.
 
-## Команды бота
-Для всех:
-- `/start` — регистрация
-- `/reset` — сброс состояния
-- `/help` — справка
+## Особенности и фоновые задачи
+- Ночная проверка 00:00–05:00 МСК: разбан работающих (ДатаУвольнения = NULL, ЧС=1), бан уволенных (ДатаУвольнения != NULL) + ЧС.
+- Логи ночной проверки и действий админов уходят в admin log chat (если задан) и в meta-БД.
+- Персональные одноразовые инвайты с TTL; просроченные удаляются.
+- Meta-БД хранит каналы отделов, админов, логи, настройки.
 
-Админ:
-- `/test_data` — проверить данные сотрудника
-- `/user_status <id|@username>`
-- `/check_hist [id|@username]`
-- `/news <текст>` — новость в канал
-- `/remove_user <id|@username> <причина>` — бан в канале отдела
-- `/bind_department <Отдел>` — привязать канал (выполнить в канале)
+## Команды (кратко)
+Пользователи: `/start`, `/reset`, `/help`  
+Админ: `/test_data`, `/user_status`, `/check_hist`, `/news`, `/remove_user`, `/bind_department`  
+Владелец: `/add_admin`, `/unadd_admin`, `/list_employees`, `/set_admin_log_chat`, `/set_news_channel`, `/check_fired`, `/test_unban`, `/unbind_all`, `/bind_department`
 
-Владелец:
-- `/add_admin <id|@username>` / `/unadd_admin <...>`
-- `/list_employees`
-- `/set_admin_log_chat` — чат для логов админов (выполнить в чате)
-- `/set_news_channel` — новостной канал (выполнить в канале)
-- `/check_fired` — проверить уволенных
-- `/test_unban` — тест разбана работающих (removed users)
-- `/unbind_all` — отвязать все каналы отделов
-- `/bind_department <Отдел>` — привязать/изменить канал (выполнить в канале)
-
-## Ночная проверка (00:00–05:00 МСК)
-- Разбан работающих (ДатаУвольнения = NULL, но в ЧС).
-- Бан уволенных (ДатаУвольнения != NULL) + добавление в ЧС.
-- Логи отправляются в admin log chat (или в консоль, если чат не задан).
-
-## Структура проекта
-- `src/bot.js` — команды и логика бота
+## Структура
+- `src/bot.js` — команды и логика
 - `src/index.js` — вход, фоновые задачи, ночная проверка
 - `src/config.js` — конфиг из `.env`
 - `src/db.js` — основная БД (LexemaCard, SQL Server)
@@ -120,19 +79,11 @@ pm2 startup   # выполнить команду, которую покажет
 - `src/services/employeeService.js` — поиск/сопоставление сотрудников
 - `src/services/inviteService.js` — инвайт-ссылки
 - `prisma/schema.prisma` — схема основной БД
-- `prisma/meta.prisma` — схема meta-БД (каналы, админы, логи)
-
-## Особенности
-- Автоуправление ЧС: работающие — разбан, уволенные — бан + ЧС.
-- Ночные проверки с логами в admin log chat.
-- Персональные одноразовые инвайты с TTL.
-- Meta-БД хранит каналы отделов, админов, логи, настройки.
+- `prisma/meta.prisma` — схема meta-БД
 
 ## Деплой в двух словах
 1) Настроить `.env`  
 2) `npm install`  
 3) `npm run prisma:generate && npm run prisma:generate:meta`  
 4) `npm run prisma:push:meta`  
-5) `npm start` или PM2.
-
-
+5) `npm start` или PM2
