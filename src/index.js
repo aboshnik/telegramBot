@@ -1,5 +1,5 @@
 import { createBot } from "./bot.js";
-import { prisma, disconnectDb } from "./db.js";
+import { prisma, disconnectDb, lexemaCard, detectTableName } from "./db.js";
 import { prismaMeta, disconnectMetaDb } from "./dbMeta.js";
 import { config } from "./config.js";
 
@@ -49,21 +49,24 @@ async function getNewsChannelIdForCron() {
   }
 }
 
+// === НОЧНАЯ ПРОВЕРКА 00:00-05:00 МСК (поиск: НОЧНАЯ ПРОВЕРКА) ===
 async function processFiredAndBlacklisted() {
   const now = new Date();
   if (!isWithinMoscowNightWindow(now)) return;
 
   try {
-    // Проверяем LexemaCard: всех пользователей без даты увольнения - разбаниваем в каналах
-    // Это нужно, чтобы разбанить пользователей, которые забанены в канале, но не уволены
-    const activeEmployees = await prisma.lexemaCard.findMany({
+    // Определяем правильное название таблицы для raw SQL запросов
+    const tableName = await detectTableName();
+    const newsChannelId = await getNewsChannelIdForCron();
+
+    // 1. Обрабатываем АКТИВНЫХ сотрудников (без даты увольнения)
+    // Разбаниваем их в каналах и убираем из черного списка, если они там есть
+    const activeEmployees = await lexemaCard.findMany({
       where: {
         terminationDate: null, // Нет даты увольнения = работает
         telegramId: { not: null },
       },
     });
-
-    const newsChannelId = await getNewsChannelIdForCron();
 
     for (const emp of activeEmployees) {
       const tgId = Number(emp.telegramId);
@@ -71,11 +74,9 @@ async function processFiredAndBlacklisted() {
       // Если в черном списке - убираем из ЧС в БД
       if (emp.blacklisted) {
         try {
-          await prisma.$executeRaw`
-            UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
-            SET ЧерныйСписок = 0 
-            WHERE VCode = ${emp.code}
-          `;
+          await prisma.$executeRawUnsafe(
+            `UPDATE [${tableName}] SET ЧерныйСписок = 0 WHERE VCode = ${emp.code}`
+          );
         } catch (err) {
           console.error("Night check: failed to remove from blacklist", err);
         }
@@ -83,25 +84,27 @@ async function processFiredAndBlacklisted() {
 
       // Разбаниваем в каналах (независимо от статуса blacklisted в БД)
       // Это разбанит пользователей, которые забанены в канале, но не уволены
-      try {
-        // Пытаемся найти канал по departmentId
-        const mapping = await prismaMeta.departmentChannel.findFirst({
-          where: { department: String(emp.departmentId || "") },
-        });
-        const deptChannelId = mapping?.channelId || config.channelId || null;
-        if (deptChannelId) {
-          try {
-            await bot.telegram.unbanChatMember(deptChannelId, tgId, { only_if_banned: true });
-          } catch (unbanErr) {
-            if (!unbanErr?.response?.description?.includes("not found") && 
-                !unbanErr?.response?.description?.includes("not in the chat")) {
-              console.log("Night check: cannot unban from department channel:", unbanErr.response?.description);
-            }
-          }
-        }
-      } catch (err) {
-        console.error("Night check: failed to unban from department channel", err);
-      }
+      
+      // ЗАКОММЕНТИРОВАНО: Пока отделов нет, убираем работу с каналами отделов
+      // try {
+      //   // Пытаемся найти канал по departmentId
+      //   const mapping = await prismaMeta.departmentChannel.findFirst({
+      //     where: { department: String(emp.departmentId || "") },
+      //   });
+      //   const deptChannelId = mapping?.channelId || config.channelId || null;
+      //   if (deptChannelId) {
+      //     try {
+      //       await bot.telegram.unbanChatMember(deptChannelId, tgId, { only_if_banned: true });
+      //     } catch (unbanErr) {
+      //       if (!unbanErr?.response?.description?.includes("not found") && 
+      //           !unbanErr?.response?.description?.includes("not in the chat")) {
+      //         console.log("Night check: cannot unban from department channel:", unbanErr.response?.description);
+      //       }
+      //     }
+      //   }
+      // } catch (err) {
+      //   console.error("Night check: failed to unban from department channel", err);
+      // }
 
       // Новостной канал
       if (newsChannelId) {
@@ -134,59 +137,74 @@ async function processFiredAndBlacklisted() {
       }
     }
 
-    // Обрабатываем EmployeeRef (старая логика для совместимости)
-    const employees = await prismaMeta.employeeRef.findMany({
+    // 2. Обрабатываем УВОЛЕННЫХ сотрудников (с датой увольнения)
+    // Баним их в каналах и добавляем в черный список
+    const firedEmployees = await lexemaCard.findMany({
       where: {
-        OR: [{ fired: true }, { blacklisted: true }],
+        terminationDate: { not: null }, // Есть дата увольнения = уволен
         telegramId: { not: null },
       },
     });
 
-    if (!employees.length) return;
-
-    for (const emp of employees) {
+    for (const emp of firedEmployees) {
       const tgId = Number(emp.telegramId);
 
-      // Канал отдела
-      try {
-        const mapping = await prismaMeta.departmentChannel.findFirst({
-          where: { department: emp.department },
-        });
-        const deptChannelId = mapping?.channelId || config.channelId || null;
-        if (deptChannelId) {
-          await bot.telegram.banChatMember(deptChannelId, tgId);
+      // Если не в черном списке - добавляем в ЧС в БД
+      if (!emp.blacklisted) {
+        try {
+          await prisma.$executeRawUnsafe(
+            `UPDATE [${tableName}] SET ЧерныйСписок = 1 WHERE VCode = ${emp.code}`
+          );
+        } catch (err) {
+          console.error("Night check: failed to add to blacklist", err);
         }
-      } catch (err) {
-        console.error("Night check: failed to ban from department channel", err);
       }
+
+      // Баним в каналах
+      
+      // ЗАКОММЕНТИРОВАНО: Пока отделов нет, убираем работу с каналами отделов
+      // try {
+      //   // Пытаемся найти канал по departmentId
+      //   const mapping = await prismaMeta.departmentChannel.findFirst({
+      //     where: { department: String(emp.departmentId || "") },
+      //   });
+      //   const deptChannelId = mapping?.channelId || config.channelId || null;
+      //   if (deptChannelId) {
+      //     try {
+      //       await bot.telegram.banChatMember(deptChannelId, tgId);
+      //     } catch (banErr) {
+      //       if (!banErr?.response?.description?.includes("not found") && 
+      //           !banErr?.response?.description?.includes("not in the chat")) {
+      //         console.log("Night check: cannot ban from department channel:", banErr.response?.description);
+      //       }
+      //     }
+      //   }
+      // } catch (err) {
+      //   console.error("Night check: failed to ban from department channel", err);
+      // }
 
       // Новостной канал
       if (newsChannelId) {
         try {
           await bot.telegram.banChatMember(newsChannelId, tgId);
-        } catch (err) {
-          console.error("Night check: failed to ban from news channel", err);
+        } catch (banErr) {
+          if (!banErr?.response?.description?.includes("not found") && 
+              !banErr?.response?.description?.includes("not in the chat")) {
+            console.log("Night check: cannot ban from news channel:", banErr.response?.description);
+          }
         }
       }
 
-      try {
-        await prismaMeta.employeeRef.update({
-          where: { id: emp.id },
-          data: { blacklisted: true },
-        });
-      } catch (err) {
-        console.error("Night check: failed to mark blacklisted", err);
-      }
-
+      // Логируем действие
       try {
         await prismaMeta.auditLog.create({
           data: {
             telegramId: BigInt(emp.telegramId),
             action: "night_auto_block",
             payloadJson: JSON.stringify({
-              empId: emp.id,
-              fired: emp.fired,
-              blacklisted: emp.blacklisted,
+              code: emp.code,
+              terminationDate: emp.terminationDate,
+              reason: "terminationDate is not null",
             }),
           },
         });
@@ -214,7 +232,7 @@ async function startBot() {
     // Стартуем очистку инвайтов
     cleanupExpiredInvites();
     setInterval(cleanupExpiredInvites, INVITE_CLEANUP_MS);
-    // Стартуем ночную проверку статусов
+    // Стартуем ночную проверку статусов (поиск: НОЧНАЯ ПРОВЕРКА таймер)
     processFiredAndBlacklisted();
     setInterval(processFiredAndBlacklisted, NIGHT_CHECK_MS);
   } catch (err) {

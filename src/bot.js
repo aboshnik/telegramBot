@@ -71,6 +71,7 @@ async function hasAdminAccess(ctx) {
 export function createBot() {
   const bot = new Telegraf(config.botToken);
 
+  // === КОМАНДА /start: запуск регистрации (поиск: КОМАНДА /start) ===
   bot.start(async (ctx) => {
     if (!isPrivate(ctx)) return;
     
@@ -92,6 +93,7 @@ export function createBot() {
     );
   });
 
+  // === КОМАНДА /help: показать список доступных команд (поиск: КОМАНДА /help) ===
   bot.command("help", async (ctx) => {
     if (!isPrivate(ctx)) return;
     
@@ -134,6 +136,7 @@ export function createBot() {
     await ctx.reply(helpText);
   });
 
+  // === КОМАНДА /reset: сбросить текущую регистрацию (поиск: КОМАНДА /reset) ===
   bot.command("reset", async (ctx) => {
     if (!isPrivate(ctx)) return;
     
@@ -155,6 +158,7 @@ export function createBot() {
     }
   });
 
+  // === КОМАНДА /bind_department: привязать чат к отделу (поиск: КОМАНДА /bind_department) ===
   bot.command("bind_department", async (ctx) => {
     if (!(await hasAdminAccess(ctx))) {
       await ctx.reply("Нет прав для выполнения этой команды.");
@@ -201,6 +205,7 @@ export function createBot() {
     );
   });
 
+  // === КОМАНДА /add_admin: добавить администратора (поиск: КОМАНДА /add_admin) ===
   bot.command("add_admin", async (ctx) => {
     if (!isOwner(ctx)) {
       await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
@@ -234,6 +239,7 @@ export function createBot() {
     );
   });
 
+  // === КОМАНДА /unadd_admin: удалить администратора (поиск: КОМАНДА /unadd_admin) ===
   bot.command("unadd_admin", async (ctx) => {
     if (!isOwner(ctx)) {
       await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
@@ -281,6 +287,7 @@ export function createBot() {
     }
   });
 
+  // === КОМАНДА /list_employees: список сотрудников (поиск: КОМАНДА /list_employees) ===
   bot.command("list_employees", async (ctx) => {
     if (!isOwner(ctx)) {
       await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
@@ -313,6 +320,7 @@ export function createBot() {
     }
   });
 
+  // === КОМАНДА /test_data: показать данные по Telegram ID/username (поиск: КОМАНДА /test_data) ===
   bot.command("test_data", async (ctx) => {
     if (!(await hasAdminAccess(ctx))) {
       await ctx.reply("Нет прав для выполнения этой команды.");
@@ -348,6 +356,7 @@ export function createBot() {
     }
   });
 
+  // === КОМАНДА /user_status: статус пользователя в каналах (поиск: КОМАНДА /user_status) ===
   bot.command("user_status", async (ctx) => {
     if (!(await hasAdminAccess(ctx))) {
       await ctx.reply("Нет прав для выполнения этой команды.");
@@ -392,6 +401,8 @@ export function createBot() {
       );
   });
 
+  // === КОМАНДА /check_hist: история действий (поиск: КОМАНДА /check_hist) ===
+  // === КОМАНДА /check_hist (расширенная): история действий (поиск: КОМАНДА /check_hist 2) ===
   bot.command("check_hist", async (ctx) => {
     if (!(await hasAdminAccess(ctx))) {
       await ctx.reply("Нет прав для выполнения этой команды.");
@@ -435,10 +446,12 @@ export function createBot() {
     await ctx.reply(chunk);
   });
 
+  // === КОМАНДА /news: отправить новость в канал (поиск: КОМАНДА /news) ===
   bot.command("news", async (ctx) => {
     await handleNewsCommand(ctx);
   });
 
+  // === КОМАНДА /set_admin_log_chat: задать чат для логов (поиск: КОМАНДА /set_admin_log_chat) ===
   bot.command("set_admin_log_chat", async (ctx) => {
     if (!isOwner(ctx)) {
       await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
@@ -512,6 +525,7 @@ export function createBot() {
     }
   });
 
+  // === КОМАНДА /set_news_channel: задать новостной канал (поиск: КОМАНДА /set_news_channel) ===
   bot.command("set_news_channel", async (ctx) => {
     const chatType = ctx.chat?.type;
     const isChannelContext = chatType === "channel" || chatType === "supergroup";
@@ -562,6 +576,7 @@ export function createBot() {
   });
 
   // Временная команда для ручной проверки БД и кика уволенных/в ЧС
+  // === КОМАНДА /check_fired: проверить уволенных и забанить (поиск: КОМАНДА /check_fired) ===
   bot.command("check_fired", async (ctx) => {
     if (!isOwner(ctx)) {
       await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
@@ -599,7 +614,7 @@ export function createBot() {
         try {
           const channelId = await resolveChannelId(String(emp.departmentId || ""));
           if (channelId) {
-            await ctx.telegram.banChatMember(channelId, tgId);
+          await ctx.telegram.banChatMember(channelId, tgId);
             deptBanned = true;
           }
         } catch (err) {
@@ -623,21 +638,21 @@ export function createBot() {
                 !err?.response?.description?.includes("chat owner")) {
               console.error(`check_fired: failed to ban ${fullName} from news channel`, err);
               errors++;
-            }
           }
+        }
         }
 
         // Устанавливаем черный список, если еще не установлен
         if (!emp.blacklisted) {
-          try {
+        try {
             await prisma.$executeRaw`
               UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
               SET ЧерныйСписок = 1 
               WHERE VCode = ${emp.code}
             `;
-          } catch (err) {
+        } catch (err) {
             console.error(`check_fired: failed to mark blacklisted for ${fullName}`, err);
-          }
+        }
         }
 
         if (deptBanned || newsBanned) {
@@ -684,6 +699,7 @@ export function createBot() {
   });
 
   // Тестовая команда для проверки разбана пользователей без даты увольнения
+  // === КОМАНДА /test_unban: тестовый разбан работающих (поиск: КОМАНДА /test_unban) ===
   bot.command("test_unban", async (ctx) => {
     if (!isOwner(ctx)) {
       await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
@@ -803,6 +819,7 @@ export function createBot() {
   });
 
   // Полный сброс привязок: EmployeeRef.telegramId/telegramUsername + очистка таблицы User
+  // === КОМАНДА /unbind_all: отвязать все отделы (поиск: КОМАНДА /unbind_all) ===
   bot.command("unbind_all", async (ctx) => {
     if (!isOwner(ctx)) {
       await ctx.reply("Нет прав для выполнения этой команды (только владелец).");
@@ -868,6 +885,7 @@ export function createBot() {
     await ctx.reply(chunk);
   });
 
+  // === КОМАНДА /remove_user: забанить пользователя вручную (поиск: КОМАНДА /remove_user) ===
   bot.command("remove_user", async (ctx) => {
     if (!(await hasAdminAccess(ctx))) {
       await ctx.reply("Нет прав для выполнения этой команды.");
@@ -958,6 +976,7 @@ export function createBot() {
     }
   });
 
+  // === ОБРАБОТЧИК текста: пошаговая регистрация (поиск: ОБРАБОТЧИК text) ===
   bot.on("text", async (ctx) => {
     // Игнорируем произвольные сообщения в группах/каналах, кроме админ-команд
     if (!isPrivate(ctx)) return;
@@ -1536,7 +1555,7 @@ async function handleVerificationAndLink(ctx, form) {
   // Проверяем: если не уволен (нет даты увольнения) - разбаниваем в каналах и убираем из ЧС
   if (!employee.terminationDate) {
     // Если в черном списке - убираем из ЧС в БД
-    if (employee.blacklisted) {
+  if (employee.blacklisted) {
       try {
         await prisma.$executeRaw`
           UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
@@ -1806,21 +1825,21 @@ async function handleVerificationAndLink(ctx, form) {
         telegramId,
         fullName: user.fullName,
         channelId: newsChannelId,
-      });
+  });
 
-      if (newsInvite) {
+  if (newsInvite) {
         await prismaMeta.auditLog.create({
-          data: {
-            telegramId: BigInt(telegramId),
-            action: "news_invite_issued",
-            payloadJson: JSON.stringify({
-              inviteLinkId: newsInvite.inviteLinkId,
-              expiresAt: newsInvite.expiresAt,
-              channelId: newsInvite.channelId,
-            }),
-          },
-        });
-      }
+      data: {
+        telegramId: BigInt(telegramId),
+        action: "news_invite_issued",
+        payloadJson: JSON.stringify({
+          inviteLinkId: newsInvite.inviteLinkId,
+          expiresAt: newsInvite.expiresAt,
+          channelId: newsInvite.channelId,
+        }),
+      },
+    });
+  }
     }
   } catch (err) {
     console.error("Failed to create news channel invite link", err);
@@ -1870,7 +1889,7 @@ async function handleVerificationAndLink(ctx, form) {
   }
 
   if (newsInvite) {
-    reply += `\n\nЕсли ссылка истечет или будет использована — запусти /start ещё раз.`;
+  reply += `\n\nЕсли ссылка истечет или будет использована — запусти /start ещё раз.`;
   }
 
   await ctx.reply(reply);
