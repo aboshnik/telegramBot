@@ -3,6 +3,12 @@ import { prisma, disconnectDb, lexemaCard, detectTableName } from "./db.js";
 import { prismaMeta, disconnectMetaDb } from "./dbMeta.js";
 import { config } from "./config.js";
 
+// Отключаем буферизацию stdout для немедленного вывода
+process.stdout.setDefaultEncoding('utf8');
+if (process.stdout.isTTY) {
+  process.stdout.setBlocking?.(true);
+}
+
 const bot = createBot();
 
 // Периодическая очистка устаревших инвайтов (expiresAt < now)
@@ -49,10 +55,53 @@ async function getNewsChannelIdForCron() {
   }
 }
 
-// === НОЧНАЯ ПРОВЕРКА 00:00-05:00 МСК (поиск: НОЧНАЯ ПРОВЕРКА) ===
+// Получение admin log chat ID
+let adminLogChatIdCache = null;
+async function getAdminLogChatId() {
+  if (adminLogChatIdCache !== null) return adminLogChatIdCache;
+  
+  try {
+    const settings = await prismaMeta.adminSettings.findUnique({ where: { id: 1 } });
+    adminLogChatIdCache = settings?.adminLogChatId || config.adminLogChatId || null;
+    return adminLogChatIdCache;
+  } catch (err) {
+    console.error("Failed to load admin log chat id", err);
+    return config.adminLogChatId || null;
+  }
+}
+
+// Отправка логов в admin log chat
+async function sendLogToAdminChat(message) {
+  try {
+    const chatId = await getAdminLogChatId();
+    if (chatId) {
+      await bot.telegram.sendMessage(chatId, message);
+    } else {
+      // Если chat не установлен, выводим в консоль
+      logImmediate(message);
+    }
+  } catch (err) {
+    // Если не удалось отправить, выводим в консоль
+    logImmediate(`Ошибка отправки лога в admin chat: ${err.message}`);
+    logImmediate(message);
+  }
+}
+
+// Функция для немедленного вывода в консоль (без буферизации)
+function logImmediate(...args) {
+  const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)).join(' ') + '\n';
+  process.stdout.write(message);
+}
+
+// === ПРОВЕРКА АКТИВНЫХ И УВОЛЕННЫХ СОТРУДНИКОВ (поиск: НОЧНАЯ ПРОВЕРКА) ===
 async function processFiredAndBlacklisted() {
   const now = new Date();
+  // Проверка времени: только в период 00:00-05:00 МСК
   if (!isWithinMoscowNightWindow(now)) return;
+  
+  const moscowTime = new Date(now.getTime() + 3 * 60 * 60 * 1000); // UTC+3
+  const timeStr = moscowTime.toISOString().slice(0, 19).replace('T', ' ');
+  await sendLogToAdminChat(`=== НАЧАЛО НОЧНОЙ ПРОВЕРКИ СОТРУДНИКОВ: ${timeStr} МСК ===`);
 
   try {
     // Определяем правильное название таблицы для raw SQL запросов
@@ -68,8 +117,11 @@ async function processFiredAndBlacklisted() {
       },
     });
 
+    const restoredEmployees = []; // Для логирования восстановленных
+
     for (const emp of activeEmployees) {
       const tgId = Number(emp.telegramId);
+      let wasRestored = false;
       
       // Если в черном списке - убираем из ЧС в БД
       if (emp.blacklisted) {
@@ -77,8 +129,9 @@ async function processFiredAndBlacklisted() {
           await prisma.$executeRawUnsafe(
             `UPDATE [${tableName}] SET ЧерныйСписок = 0 WHERE VCode = ${emp.code}`
           );
+          wasRestored = true;
         } catch (err) {
-          console.error("Night check: failed to remove from blacklist", err);
+          // Игнорируем ошибки, логируем только критичные
         }
       }
 
@@ -98,24 +151,29 @@ async function processFiredAndBlacklisted() {
       //     } catch (unbanErr) {
       //       if (!unbanErr?.response?.description?.includes("not found") && 
       //           !unbanErr?.response?.description?.includes("not in the chat")) {
-      //         console.log("Night check: cannot unban from department channel:", unbanErr.response?.description);
+      //         // Игнорируем ошибки
       //       }
       //     }
       //   }
       // } catch (err) {
-      //   console.error("Night check: failed to unban from department channel", err);
+      //   // Игнорируем ошибки
       // }
 
       // Новостной канал
       if (newsChannelId) {
         try {
           await bot.telegram.unbanChatMember(newsChannelId, tgId, { only_if_banned: true });
-        } catch (unbanErr) {
-          if (!unbanErr?.response?.description?.includes("not found") && 
-              !unbanErr?.response?.description?.includes("not in the chat")) {
-            console.log("Night check: cannot unban from news channel:", unbanErr.response?.description);
+          if (emp.blacklisted) {
+            wasRestored = true;
           }
+        } catch (unbanErr) {
+          // Игнорируем ошибки "not found" и "not in the chat"
         }
+      }
+
+      // Если был восстановлен (был в черном списке) - добавляем в список для логирования
+      if (wasRestored && emp.blacklisted) {
+        restoredEmployees.push(emp);
       }
 
       // Логируем только если был в черном списке
@@ -132,9 +190,19 @@ async function processFiredAndBlacklisted() {
             },
           });
         } catch (err) {
-          console.error("Night check: failed to write audit log", err);
+          // Игнорируем ошибки логирования
         }
       }
+    }
+    
+    // Логируем восстановленных сотрудников
+    if (restoredEmployees.length > 0) {
+      let logMessage = `\nВосстановление в канал (${restoredEmployees.length}):\n`;
+      for (const emp of restoredEmployees) {
+        const fio = `${emp.lastName || ''} ${emp.firstName || ''} ${emp.middleName || ''}`.trim();
+        logMessage += `${fio}, подразделение: ${emp.departmentId || 'не указано'}, должность: ${emp.positionId || 'не указана'}\n`;
+      }
+      await sendLogToAdminChat(logMessage);
     }
 
     // 2. Обрабатываем УВОЛЕННЫХ сотрудников (с датой увольнения)
@@ -146,8 +214,11 @@ async function processFiredAndBlacklisted() {
       },
     });
 
+    const firedEmployeesLog = []; // Для логирования уволенных
+
     for (const emp of firedEmployees) {
       const tgId = Number(emp.telegramId);
+      let addedToBlacklist = false;
 
       // Если не в черном списке - добавляем в ЧС в БД
       if (!emp.blacklisted) {
@@ -155,8 +226,9 @@ async function processFiredAndBlacklisted() {
           await prisma.$executeRawUnsafe(
             `UPDATE [${tableName}] SET ЧерныйСписок = 1 WHERE VCode = ${emp.code}`
           );
+          addedToBlacklist = true;
         } catch (err) {
-          console.error("Night check: failed to add to blacklist", err);
+          // Игнорируем ошибки, логируем только критичные
         }
       }
 
@@ -173,14 +245,11 @@ async function processFiredAndBlacklisted() {
       //     try {
       //       await bot.telegram.banChatMember(deptChannelId, tgId);
       //     } catch (banErr) {
-      //       if (!banErr?.response?.description?.includes("not found") && 
-      //           !banErr?.response?.description?.includes("not in the chat")) {
-      //         console.log("Night check: cannot ban from department channel:", banErr.response?.description);
-      //       }
+      //       // Игнорируем ошибки
       //     }
       //   }
       // } catch (err) {
-      //   console.error("Night check: failed to ban from department channel", err);
+      //   // Игнорируем ошибки
       // }
 
       // Новостной канал
@@ -188,12 +257,15 @@ async function processFiredAndBlacklisted() {
         try {
           await bot.telegram.banChatMember(newsChannelId, tgId);
         } catch (banErr) {
-          if (!banErr?.response?.description?.includes("not found") && 
-              !banErr?.response?.description?.includes("not in the chat")) {
-            console.log("Night check: cannot ban from news channel:", banErr.response?.description);
-          }
+          // Игнорируем ошибки "not found" и "not in the chat"
         }
       }
+
+      // Добавляем в список для логирования
+      firedEmployeesLog.push({
+        emp,
+        addedToBlacklist: addedToBlacklist || emp.blacklisted
+      });
 
       // Логируем действие
       try {
@@ -209,11 +281,25 @@ async function processFiredAndBlacklisted() {
           },
         });
       } catch (err) {
-        console.error("Night check: failed to write audit log", err);
+        // Игнорируем ошибки логирования
       }
     }
+    
+    // Логируем уволенных сотрудников
+    if (firedEmployeesLog.length > 0) {
+      let logMessage = `\nУволены (${firedEmployeesLog.length}):\n`;
+      for (const { emp, addedToBlacklist } of firedEmployeesLog) {
+        const fio = `${emp.lastName || ''} ${emp.firstName || ''} ${emp.middleName || ''}`.trim();
+        const blacklistStatus = addedToBlacklist ? 'да' : 'нет';
+        logMessage += `${fio}, подразделение: ${emp.departmentId || 'не указано'}, должность: ${emp.positionId || 'не указана'}, занесены в черный список: ${blacklistStatus}\n`;
+      }
+      await sendLogToAdminChat(logMessage);
+    }
+    await sendLogToAdminChat(`\n=== ЗАВЕРШЕНИЕ НОЧНОЙ ПРОВЕРКИ ===`);
   } catch (err) {
-    console.error("Night check failed", err);
+    const errorMsg = `Ошибка ночной проверки: ${err.message}\nStack trace: ${err.stack}`;
+    await sendLogToAdminChat(errorMsg);
+    logImmediate("Night check failed", err);
   }
 }
 
@@ -232,7 +318,9 @@ async function startBot() {
     // Стартуем очистку инвайтов
     cleanupExpiredInvites();
     setInterval(cleanupExpiredInvites, INVITE_CLEANUP_MS);
-    // Стартуем ночную проверку статусов (поиск: НОЧНАЯ ПРОВЕРКА таймер)
+    
+    // Ночная проверка статусов (поиск: НОЧНАЯ ПРОВЕРКА таймер)
+    // Запускаем сразу и затем каждые 15 минут
     processFiredAndBlacklisted();
     setInterval(processFiredAndBlacklisted, NIGHT_CHECK_MS);
   } catch (err) {
@@ -253,4 +341,5 @@ process.once("SIGTERM", async () => {
   await Promise.all([disconnectDb(), disconnectMetaDb()]);
   await bot.stop("SIGTERM");
 });
+
 

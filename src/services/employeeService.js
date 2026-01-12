@@ -1,3 +1,5 @@
+import { lexemaCard } from '../db.js';
+
 export async function findEmployee(prisma, { lastName, firstName, middleName, positionId, departmentId, phoneNumber }) {
   const norm = (s) => (s || "").trim();
   const onlyDigits = (s) => String(s || "").replace(/\D/g, "");
@@ -22,7 +24,7 @@ export async function findEmployee(prisma, { lastName, firstName, middleName, po
   }
 
   // Ищем кандидатов по ФИО, должности и подразделению
-  let candidates = await prisma.lexemaCard.findMany({
+  let candidates = await lexemaCard.findMany({
     where,
   });
 

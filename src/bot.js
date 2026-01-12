@@ -1,7 +1,7 @@
 import { Telegraf, Markup } from "telegraf";
 import { formatISO9075 } from "date-fns";
 import { config } from "./config.js";
-import { prisma } from "./db.js";
+import { prisma, lexemaCard } from "./db.js";
 import { prismaMeta } from "./dbMeta.js";
 import { findEmployee } from "./services/employeeService.js";
 import { getOrCreateInviteLink } from "./services/inviteService.js";
@@ -327,7 +327,7 @@ export function createBot() {
       return;
     }
     try {
-      const employees = await prisma.lexemaCard.findMany({
+      const employees = await lexemaCard.findMany({
         take: 10,
         orderBy: { code: 'asc' }
       });
@@ -585,7 +585,7 @@ export function createBot() {
 
     try {
       // Проверяем LexemaCard: ищем сотрудников с датой увольнения (terminationDate не NULL)
-      const firedEmployees = await prisma.lexemaCard.findMany({
+      const firedEmployees = await lexemaCard.findMany({
         where: {
           terminationDate: { not: null },
           telegramId: { not: null },
@@ -646,7 +646,7 @@ export function createBot() {
         if (!emp.blacklisted) {
         try {
             await prisma.$executeRaw`
-              UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
+              UPDATE [Lexema_Кадры_ЛичнаяКарточка] 
               SET ЧерныйСписок = 1 
               WHERE VCode = ${emp.code}
             `;
@@ -722,7 +722,7 @@ export function createBot() {
           ТелеграмЮзернейм as telegramUsername,
           ТелеграмID as telegramId,
           CAST(ЧерныйСписок AS INT) as blacklisted
-        FROM [Лексема_Кадры_ЛичнаяКарточка]
+        FROM [Lexema_Кадры_ЛичнаяКарточка]
         WHERE ДатаУвольнения IS NULL 
           AND ТелеграмID IS NOT NULL
       `;
@@ -776,7 +776,7 @@ export function createBot() {
         if (wasBlacklisted) {
           try {
             await prisma.$executeRaw`
-              UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
+              UPDATE [Lexema_Кадры_ЛичнаяКарточка] 
               SET ЧерныйСписок = 0 
               WHERE VCode = ${emp.code}
             `;
@@ -1558,7 +1558,7 @@ async function handleVerificationAndLink(ctx, form) {
   if (employee.blacklisted) {
       try {
         await prisma.$executeRaw`
-          UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
+          UPDATE [Lexema_Кадры_ЛичнаяКарточка] 
           SET ЧерныйСписок = 0 
           WHERE VCode = ${employee.code}
         `;
@@ -1681,9 +1681,9 @@ async function handleVerificationAndLink(ctx, form) {
 
     try {
       // Используем raw query для обновления BIT поля в SQL Server
-      // Используем русское название таблицы
+      // Используем смешанное название таблицы (латинская L + кириллица)
       await prisma.$executeRaw`
-        UPDATE [Лексема_Кадры_ЛичнаяКарточка] 
+        UPDATE [Lexema_Кадры_ЛичнаяКарточка] 
         SET ЧерныйСписок = 1 
         WHERE VCode = ${employee.code}
       `;
@@ -1760,7 +1760,7 @@ async function handleVerificationAndLink(ctx, form) {
   if (!employee.telegramId || !employee.telegramUsername) {
     try {
       // Проверяем, можно ли сохранить telegramId
-      const existingByTelegram = await prisma.lexemaCard.findFirst({
+      const existingByTelegram = await lexemaCard.findFirst({
         where: { telegramId: BigInt(telegramId) },
       });
       const isSameId =
@@ -1777,7 +1777,7 @@ async function handleVerificationAndLink(ctx, form) {
         return;
       }
 
-      await prisma.lexemaCard.update({
+      await lexemaCard.update({
         where: { code: employee.code },
         data: {
           telegramId: canSetTelegramId ? BigInt(telegramId) : undefined,
