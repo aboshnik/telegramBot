@@ -4,67 +4,191 @@ export const prisma = new PrismaClient();
 
 // Кэш для определения правильного названия таблицы
 let detectedTableName = null;
-const TABLE_NAMES = [
-  "Lexema_Кадры_ЛичнаяКарточка",    // Смешанное название (латинская L + кириллица) - текущий вариант
-  "Lexema_Kadry_LichnayaKartochka", // Английское название
-  "Лексема_Кадры_ЛичнаяКарточка",   // Полностью русское название
-];
+// Маппинг реальных названий колонок в БД (для поддержки альтернативных названий)
+let detectedColumnMapping = {};
 
-// Функция для автоматического определения правильного названия таблицы
-// Поддерживает как русское, так и английское название таблицы
+// Обязательные колонки для работы бота (с альтернативными названиями)
+const REQUIRED_COLUMNS_MAP = {
+  'VCode': ['VCode', 'Code', 'code', 'VCODE'],  // код сотрудника
+  'Фамилия': ['Фамилия', 'LastName', 'lastName', 'last_name', 'ФАМИЛИЯ'],  // фамилия
+  'Имя': ['Имя', 'FirstName', 'firstName', 'first_name', 'ИМЯ'],  // имя
+  'Отчество': ['Отчество', 'MiddleName', 'middleName', 'middle_name', 'ОТЧЕСТВО'],  // отчество
+  'Подразделение': ['Подразделение', 'DepartmentId', 'departmentId', 'department_id', 'ПОДРАЗДЕЛЕНИЕ'],  // ID подразделения
+  'Должность': ['Должность', 'PositionId', 'positionId', 'position_id', 'ДОЛЖНОСТЬ'],  // ID должности
+  'Сотовый': ['Сотовый', 'Phone', 'phone', 'СОТОВЫЙ'],  // телефон
+  'ДатаУвольнения': ['ДатаУвольнения', 'TerminationDate', 'terminationDate', 'termination_date', 'Дата_Увольнения', 'ДАТАУВОЛЬНЕНИЯ'],  // дата увольнения
+  'ТелеграмID': ['ТелеграмID', 'TelegramId', 'telegramId', 'telegram_id', 'Телеграм_ID', 'ТЕЛЕГРАМID'],  // Telegram ID (обязательно)
+  'ТелеграмЮзернейм': ['ТелеграмЮзернейм', 'TelegramUsername', 'telegramUsername', 'telegram_username', 'Телеграм_Юзернейм', 'ТЕЛЕГРАМЮЗЕРНЕЙМ'],  // Telegram username (обязательно)
+  'ЧерныйСписок': ['ЧерныйСписок', 'Blacklisted', 'blacklisted', 'black_listed', 'Черный_Список', 'ЧЕРНЫЙСПИСОК'],  // черный список (обязательно)
+};
+
+// Опциональные колонки (в данный момент нет)
+const OPTIONAL_COLUMNS_MAP = {};
+
+// Список обязательных колонок для логирования
+const REQUIRED_COLUMNS = Object.keys(REQUIRED_COLUMNS_MAP);
+const OPTIONAL_COLUMNS = Object.keys(OPTIONAL_COLUMNS_MAP);
+
+/**
+ * Проверяет, содержит ли набор колонок все обязательные колонки (с учетом альтернативных названий)
+ */
+function hasAllRequiredColumns(columnNames) {
+  const columnNamesLower = new Set(Array.from(columnNames).map(name => name.toLowerCase()));
+  
+  for (const [requiredCol, alternatives] of Object.entries(REQUIRED_COLUMNS_MAP)) {
+    const found = alternatives.some(alt => 
+      columnNames.has(alt) || columnNamesLower.has(alt.toLowerCase())
+    );
+    if (!found) {
+      return { hasAll: false, missing: requiredCol };
+    }
+  }
+  
+  return { hasAll: true, missing: null };
+}
+
+/**
+ * Находит реальное название колонки в БД по альтернативным вариантам
+ */
+function findColumnName(columnNames, requiredCol) {
+  const alternatives = REQUIRED_COLUMNS_MAP[requiredCol] || OPTIONAL_COLUMNS_MAP[requiredCol] || [requiredCol];
+  const columnNamesLower = new Map(Array.from(columnNames).map(name => [name.toLowerCase(), name]));
+  
+  for (const alt of alternatives) {
+    if (columnNames.has(alt)) {
+      return alt;
+    }
+    const lowerAlt = alt.toLowerCase();
+    if (columnNamesLower.has(lowerAlt)) {
+      return columnNamesLower.get(lowerAlt);
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Автоматически находит таблицу в БД по набору обязательных колонок
+ * Сканирует все таблицы в базе данных и ищет первую, которая содержит все необходимые колонки
+ */
 export async function detectTableName() {
   if (detectedTableName) {
     return detectedTableName;
   }
 
-  // Проверяем текущую базу данных
   try {
+    // Получаем информацию о текущей базе данных
     const dbInfo = await prisma.$queryRawUnsafe(`SELECT DB_NAME() AS CurrentDatabase`);
     const currentDb = dbInfo[0]?.CurrentDatabase;
     console.log(`📊 Текущая база данных: ${currentDb || 'не определена'}`);
-    if (currentDb && currentDb.toLowerCase() !== 'lktest') {
-      console.warn(`⚠ Внимание: ожидается база данных 'lktest', но используется '${currentDb}'. Проверьте DB_URL в .env файле.`);
+    
+    // Получаем список всех таблиц в текущей базе данных
+    const tables = await prisma.$queryRawUnsafe(`
+      SELECT TABLE_NAME 
+      FROM INFORMATION_SCHEMA.TABLES 
+      WHERE TABLE_TYPE = 'BASE TABLE'
+      ORDER BY TABLE_NAME
+    `);
+    
+    if (!tables || tables.length === 0) {
+      throw new Error('В базе данных не найдено ни одной таблицы');
     }
-  } catch (dbErr) {
-    console.warn(`⚠ Не удалось определить текущую базу данных:`, dbErr.message);
-  }
-  
-  for (const tableName of TABLE_NAMES) {
-    try {
-      // Используем правильный синтаксис SQL Server с квадратными скобками для кириллицы
-      const result = await prisma.$queryRawUnsafe(
-        `SELECT TOP 1 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '${tableName.replace(/'/g, "''")}'`
-      );
+    
+    console.log(`🔍 Найдено таблиц в БД: ${tables.length}. Проверяю наличие обязательных колонок...`);
+    
+    // Проверяем каждую таблицу на наличие обязательных колонок
+    for (const table of tables) {
+      const tableName = table.TABLE_NAME;
       
-      if (result && Array.isArray(result) && result.length > 0) {
-        detectedTableName = tableName;
-        console.log(`✓ Таблица автоматически определена: ${tableName}`);
-        return tableName;
+      try {
+        // Получаем список колонок для текущей таблицы
+        const columns = await prisma.$queryRawUnsafe(`
+          SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+          FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_NAME = '${tableName.replace(/'/g, "''")}'
+        `);
+        
+        if (!columns || columns.length === 0) {
+          console.log(`  ⚠ Таблица [${tableName}]: колонки не найдены`);
+          continue;
+        }
+        
+        // Создаем Set для быстрого поиска колонок
+        const columnNames = new Set(columns.map(col => col.COLUMN_NAME));
+        
+        // Логируем найденные колонки для отладки
+        console.log(`\n  📋 Таблица [${tableName}]:`);
+        console.log(`     Найдено колонок: ${columns.length}`);
+        console.log(`     Колонки: ${Array.from(columnNames).join(', ')}`);
+        
+        // Проверяем наличие всех обязательных колонок (с учетом альтернативных названий)
+        const checkResult = hasAllRequiredColumns(columnNames);
+        
+        if (checkResult.hasAll) {
+          // Создаем маппинг реальных названий колонок для использования в SQL
+          const columnMapping = {};
+          
+          // Маппинг обязательных колонок
+          for (const requiredCol of REQUIRED_COLUMNS) {
+            const realName = findColumnName(columnNames, requiredCol);
+            if (realName) {
+              columnMapping[requiredCol] = realName;
+            }
+          }
+          
+          // Маппинг опциональных колонок (если они есть)
+          for (const optionalCol of OPTIONAL_COLUMNS) {
+            const realName = findColumnName(columnNames, optionalCol);
+            if (realName) {
+              columnMapping[optionalCol] = realName;
+            }
+          }
+          
+          // Сохраняем маппинг для использования в SQL запросах
+          detectedColumnMapping = columnMapping;
+          
+          // Проверяем наличие опциональных колонок для информативности
+          const hasOptional = OPTIONAL_COLUMNS.filter(col => {
+            const realName = findColumnName(columnNames, col);
+            return realName !== null;
+          });
+          
+          detectedTableName = tableName;
+          console.log(`\n✓ Таблица найдена: [${tableName}]`);
+          console.log(`  Обязательные колонки: ✓ (${REQUIRED_COLUMNS.length}/${REQUIRED_COLUMNS.length})`);
+          console.log(`  Маппинг колонок:`, columnMapping);
+          
+          // Логируем опциональные колонки только если они есть
+          if (OPTIONAL_COLUMNS.length > 0) {
+            const hasOptional = OPTIONAL_COLUMNS.filter(col => {
+              const realName = findColumnName(columnNames, col);
+              return realName !== null;
+            });
+            console.log(`  Опциональные колонки: ${hasOptional.length}/${OPTIONAL_COLUMNS.length} (${hasOptional.join(', ') || 'отсутствуют'})`);
+          }
+          
+          return tableName;
+        } else {
+          console.log(`  ❌ Не хватает обязательной колонки: ${checkResult.missing}`);
+          console.log(`     Ожидаемые варианты: ${REQUIRED_COLUMNS_MAP[checkResult.missing]?.join(', ') || checkResult.missing}`);
+        }
+      } catch (err) {
+        console.error(`  ❌ Ошибка при проверке таблицы [${tableName}]:`, err.message);
+        continue;
       }
-    } catch (err) {
-      // Игнорируем ошибки и пробуем следующий вариант
-      continue;
     }
-  }
-  
-  // Если не нашли, пробуем через INFORMATION_SCHEMA с более широким поиском
-  try {
-    const allTables = await prisma.$queryRawUnsafe(
-      `SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME LIKE '%Lexema%' OR TABLE_NAME LIKE '%Лексема%' OR TABLE_NAME LIKE '%Kadry%' OR TABLE_NAME LIKE '%Кадры%'`
+    
+    // Если не нашли подходящую таблицу
+    console.error(`\n❌ Не найдено таблицы с обязательными колонками: ${REQUIRED_COLUMNS.join(', ')}`);
+    throw new Error(
+      `Не найдено таблицы с обязательными колонками: ${REQUIRED_COLUMNS.join(', ')}\n` +
+      `Проверьте, что в базе данных есть таблица с этими колонками.`
     );
-    if (allTables && Array.isArray(allTables) && allTables.length > 0) {
-      const foundName = allTables[0].TABLE_NAME;
-      detectedTableName = foundName;
-      console.log(`✓ Таблица найдена через поиск: ${foundName}`);
-      return foundName;
-    }
-  } catch (searchErr) {
-    console.error("Ошибка при поиске таблицы:", searchErr);
+    
+  } catch (err) {
+    console.error('❌ Ошибка при поиске таблицы:', err.message);
+    throw err;
   }
-  
-  console.warn("⚠ Не удалось автоматически определить название таблицы. Используется значение из schema.prisma");
-  detectedTableName = TABLE_NAMES[0]; // Fallback на английское
-  return detectedTableName;
 }
 
 // Функция для преобразования результатов raw SQL в формат Prisma
@@ -155,7 +279,16 @@ function buildWhereClause(where) {
   return whereClause;
 }
 
+// Безопасное экранирование имени таблицы для SQL Server
+// Использует квадратные скобки для поддержки кириллицы и специальных символов
+function escapeTableName(tableName) {
+  if (!tableName) return '';
+  // Заменяем закрывающие квадратные скобки на двойные для экранирования
+  return `[${tableName.replace(/\]/g, ']]')}]`;
+}
+
 // Маппинг названий полей Prisma на названия колонок в БД
+// Использует реальные названия колонок из обнаруженной таблицы
 function getColumnName(prismaField) {
   const mapping = {
     code: 'VCode',
@@ -170,7 +303,45 @@ function getColumnName(prismaField) {
     telegramId: 'ТелеграмID',
     blacklisted: 'ЧерныйСписок',
   };
-  return mapping[prismaField] || prismaField;
+  
+  const expectedColName = mapping[prismaField] || prismaField;
+  
+  // Если есть маппинг реальных названий колонок, используем его
+  if (detectedColumnMapping && detectedColumnMapping[expectedColName]) {
+    return detectedColumnMapping[expectedColName];
+  }
+  
+  return expectedColName;
+}
+
+// Формирует SELECT список с использованием реальных названий колонок
+function buildSelectList() {
+  const vCodeCol = getColumnName('code');
+  const lastNameCol = getColumnName('lastName');
+  const firstNameCol = getColumnName('firstName');
+  const middleNameCol = getColumnName('middleName');
+  const departmentIdCol = getColumnName('departmentId');
+  const positionIdCol = getColumnName('positionId');
+  const terminationDateCol = getColumnName('terminationDate');
+  const phoneCol = getColumnName('phone');
+  
+  // Опциональные колонки (могут отсутствовать)
+  const telegramUsernameCol = getColumnName('telegramUsername');
+  const telegramIdCol = getColumnName('telegramId');
+  const blacklistedCol = getColumnName('blacklisted');
+  
+  return `SELECT 
+    [${vCodeCol}] as code,
+    [${lastNameCol}] as lastName,
+    [${firstNameCol}] as firstName,
+    [${middleNameCol}] as middleName,
+    [${departmentIdCol}] as departmentId,
+    [${positionIdCol}] as positionId,
+    [${terminationDateCol}] as terminationDate,
+    [${phoneCol}] as phone,
+    [${telegramUsernameCol}] as telegramUsername,
+    [${telegramIdCol}] as telegramId,
+    CAST([${blacklistedCol}] AS INT) as blacklisted`;
 }
 
 // Обертка для автоматического определения и использования правильного названия таблицы
@@ -181,19 +352,7 @@ export const lexemaCard = {
     const tableName = detectedTableName;
     
     try {
-      let sql = `SELECT 
-        VCode as code,
-        Фамилия as lastName,
-        Имя as firstName,
-        Отчество as middleName,
-        Подразделение as departmentId,
-        Должность as positionId,
-        ДатаУвольнения as terminationDate,
-        Сотовый as phone,
-        ТелеграмЮзернейм as telegramUsername,
-        ТелеграмID as telegramId,
-        CAST(ЧерныйСписок AS INT) as blacklisted
-      FROM [${tableName}]`;
+      let sql = `${buildSelectList()} FROM ${escapeTableName(tableName)}`;
       
       // Добавляем WHERE условия
       if (options.where) {
@@ -236,19 +395,7 @@ export const lexemaCard = {
     const tableName = detectedTableName;
     
     try {
-      let sql = `SELECT TOP 1
-        VCode as code,
-        Фамилия as lastName,
-        Имя as firstName,
-        Отчество as middleName,
-        Подразделение as departmentId,
-        Должность as positionId,
-        ДатаУвольнения as terminationDate,
-        Сотовый as phone,
-        ТелеграмЮзернейм as telegramUsername,
-        ТелеграмID as telegramId,
-        CAST(ЧерныйСписок AS INT) as blacklisted
-      FROM [${tableName}]`;
+      let sql = `${buildSelectList().replace('SELECT', 'SELECT TOP 1')} FROM ${escapeTableName(tableName)}`;
       
       // Добавляем WHERE условия
       if (options.where) {
@@ -319,7 +466,7 @@ export const lexemaCard = {
         throw new Error('where clause is required for update');
       }
       
-      const sql = `UPDATE [${tableName}] SET ${setParts.join(', ')} ${whereClause}`;
+      const sql = `UPDATE ${escapeTableName(tableName)} SET ${setParts.join(', ')} ${whereClause}`;
       await prisma.$executeRawUnsafe(sql);
       
       // Возвращаем обновленную запись
@@ -367,7 +514,7 @@ export const lexemaCard = {
         throw new Error('No fields to insert');
       }
       
-      const sql = `INSERT INTO [${tableName}] (${columns.join(', ')}) VALUES (${values.join(', ')})`;
+      const sql = `INSERT INTO ${escapeTableName(tableName)} (${columns.join(', ')}) VALUES (${values.join(', ')})`;
       await prisma.$executeRawUnsafe(sql);
       
       // Если есть code в data, возвращаем созданную запись
@@ -396,7 +543,7 @@ export const lexemaCard = {
         throw new Error('where clause is required for delete');
       }
       
-      const sql = `DELETE FROM [${tableName}] ${whereClause}`;
+      const sql = `DELETE FROM ${escapeTableName(tableName)} ${whereClause}`;
       await prisma.$executeRawUnsafe(sql);
       
       return { count: 1 };
@@ -419,7 +566,7 @@ export const lexemaCard = {
         }
       }
       
-      const sql = `DELETE FROM [${tableName}]${whereClause}`;
+      const sql = `DELETE FROM ${escapeTableName(tableName)}${whereClause}`;
       const result = await prisma.$executeRawUnsafe(sql);
       
       // SQL Server не возвращает количество удаленных строк напрямую через executeRaw
@@ -486,7 +633,7 @@ export const lexemaCard = {
     const tableName = detectedTableName;
     
     try {
-      let sql = `SELECT COUNT(*) as count FROM [${tableName}]`;
+      let sql = `SELECT COUNT(*) as count FROM ${escapeTableName(tableName)}`;
       
       if (options.where) {
         const whereClause = buildWhereClause(options.where);
