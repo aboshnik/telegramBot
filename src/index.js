@@ -313,6 +313,7 @@ process.on("uncaughtException", (err) => {
 
 async function startBot() {
   try {
+
     await bot.launch();
     console.log("Bot is running...");
     // Стартуем очистку инвайтов

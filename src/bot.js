@@ -13,6 +13,10 @@ const isOwner = (ctx) =>
 // Хранилище состояний пользователей для поэтапного заполнения
 const userStates = new Map(); // telegramId -> { step, data: { fullName, phoneNumber, position, department } }
 
+// Хранилище состояний рассылки для админов/владельца
+// adminId -> { step, targetType, departmentId?, targetCode?, text?, mediaType?, mediaFileId? }
+const broadcastStates = new Map();
+
 // Регулярное выражение для валидации номера телефона (разрешаем +7, цифры и разделители)
 const phoneRegex = /^\+?[\d\s\-\(\)]+$/;
 
@@ -115,6 +119,8 @@ export function createBot() {
       helpText += "/user_status <id|@username> - Статус пользователя в канале отдела\n";
       helpText += "/check_hist [id|@username] - История действий (последние 10 записей)\n";
       helpText += "/news <текст> - Отправить новость в новостной канал\n";
+      helpText += "/send_invites - Массовая рассылка инвайт-ссылок на внутренний канал\n";
+      helpText += "/broadcast - Рассылка сообщений сотрудникам\n";
       helpText += "/remove_user <id|@username> <причина> - Забанить пользователя в канале отдела\n";
       helpText += "/bind_department <Отдел> - Привязать канал к отделу (выполнить в канале)\n\n";
     }
@@ -178,6 +184,14 @@ export function createBot() {
       await ctx.reply("Не удалось определить chat_id.");
       return;
     }
+
+       
+
+
+
+
+
+
 
     const existing = await prismaMeta.departmentChannel.findUnique({
       where: { department: args },
@@ -328,7 +342,7 @@ export function createBot() {
     }
     try {
       const employees = await lexemaCard.findMany({
-        take: 10,
+        take: 2,
         orderBy: { code: 'asc' }
       });
       if (!employees.length) {
@@ -340,8 +354,7 @@ export function createBot() {
         `Фамилия: ${e.lastName || '—'}`,
         `Имя: ${e.firstName || '—'}`,
         `Отчество: ${e.middleName || '—'}`,
-        `Подразделение: ${e.departmentId || '—'}`,
-        `Должность: ${e.positionId || '—'}`,
+        `ТабельныйНомер: ${e.tabNumber || '—'}`,
         `ДатаУвольнения: ${e.terminationDate ? e.terminationDate.toISOString() : '—'}`,
         `Сотовый: ${e.phone || '—'}`,
         `ТелеграмЮзернейм: ${e.telegramUsername || '—'}`,
@@ -451,6 +464,376 @@ export function createBot() {
     await handleNewsCommand(ctx);
   });
 
+  // === КОМАНДА /send_invites: массовая рассылка инвайт-ссылок на внутренний канал (поиск: КОМАНДА /send_invites) ===
+  bot.command("send_invites", async (ctx) => {
+    if (!isPrivate(ctx)) return;
+
+    const isAdminUser = await hasAdminAccess(ctx);
+    if (!isAdminUser) {
+      await ctx.reply(
+        "Нет прав для выполнения этой команды (только администратор или владелец)."
+      );
+      return;
+    }
+
+    const newsChannelId = await getNewsChannelId();
+    if (!newsChannelId) {
+      await ctx.reply(
+        "Новостной(внутренний) канал не настроен. Используй /set_news_channel в нужном канале или задай NEWS_CHANNEL_ID в .env."
+      );
+      return;
+    }
+
+    await ctx.reply("Начинаю массовую рассылку инвайт-ссылок...");
+
+    try {
+      // Получаем всех работающих сотрудников с telegramId
+      const employees = await lexemaCard.findMany({
+        where: {
+          terminationDate: null, // Работающие
+          telegramId: { not: null }, // С привязанным Telegram
+        },
+      });
+
+      if (!employees.length) {
+        await ctx.reply("Не найдено сотрудников с привязанным Telegram ID.");
+        return;
+      }
+
+      let sent = 0;
+      let failed = 0;
+      const failedList = [];
+
+      for (const emp of employees) {
+        const telegramId = Number(emp.telegramId);
+        if (!telegramId) continue;
+
+        try {
+          // Формируем полное имя
+          const fullNameParts = [
+            emp.lastName,
+            emp.firstName,
+            emp.middleName,
+          ].filter(Boolean);
+          const fullName = fullNameParts.length > 0 ? fullNameParts.join(" ") : `Сотрудник #${emp.code}`;
+
+          // Создаём или получаем существующую активную инвайт-ссылку
+          const invite = await getOrCreateInviteLink({
+            telegram: ctx.telegram,
+            prisma: prismaMeta,
+            telegramId,
+            fullName,
+            channelId: newsChannelId,
+          });
+
+          // Отправляем сообщение с ссылкой
+          const message = 
+            `Привет, ${emp.firstName || "коллега"}! 👋\n\n` +
+            `Приглашаем тебя во внутренний информационный канал сотрудников:\n\n` +
+            `📰 В команде | «Салаватстекло»\n` +
+            `${invite.url}\n\n` +
+            `Действует до: ${invite.expiresAt.toISOString().slice(0, 19).replace('T', ' ')}\n\n` +
+            `Если ссылка истечет или будет использована — обратись к администратору.`;
+
+          await ctx.telegram.sendMessage(telegramId, message);
+          sent++;
+
+          // Небольшая задержка, чтобы не превысить rate limits
+          await new Promise(resolve => setTimeout(resolve, 100));
+        } catch (err) {
+          failed++;
+          const name = `${emp.lastName || ""} ${emp.firstName || ""}`.trim() || `ID: ${telegramId}`;
+          failedList.push(`${name} (${telegramId}): ${err.response?.description || err.message}`);
+          
+          // Логируем ошибку
+          console.error(`Failed to send invite to ${telegramId}:`, err.message);
+        }
+      }
+
+      // Отправляем итоговую статистику
+      let report = `✅ Рассылка завершена!\n\n`;
+      report += `📊 Статистика:\n`;
+      report += `• Отправлено: ${sent}\n`;
+      report += `• Ошибок: ${failed}\n`;
+      report += `• Всего обработано: ${employees.length}\n`;
+
+      if (failedList.length > 0) {
+        report += `\n❌ Ошибки отправки:\n`;
+        // Показываем максимум 10 ошибок, чтобы не перегрузить сообщение
+        const errorsToShow = failedList.slice(0, 10);
+        report += errorsToShow.map((e, i) => `${i + 1}. ${e}`).join("\n");
+        if (failedList.length > 10) {
+          report += `\n... и ещё ${failedList.length - 10} ошибок`;
+        }
+      }
+
+      await ctx.reply(report);
+
+      // Логируем в admin log chat
+      await logAdminAction(ctx, {
+        action: "mass_invite_sent",
+        actorId: ctx.from.id,
+        actorUsername: ctx.from.username,
+        reason: `Отправлено ${sent} инвайт-ссылок, ошибок: ${failed}`,
+      });
+    } catch (err) {
+      console.error("Mass invite failed:", err);
+      await ctx.reply(`Ошибка при массовой рассылке: ${err.message}`);
+    }
+  });
+
+  // === КОМАНДА /broadcast: рассылка сообщений (поиск: КОМАНДА /broadcast) ===
+  bot.command("broadcast", async (ctx) => {
+    if (!isPrivate(ctx)) return;
+
+    const isAdminUser = await hasAdminAccess(ctx);
+    if (!isAdminUser) {
+      await ctx.reply(
+        "Нет прав для выполнения этой команды (только администратор или владелец)."
+      );
+      return;
+    }
+
+    const telegramId = ctx.from?.id;
+    if (!telegramId) {
+      await ctx.reply("Не удалось получить твой Telegram ID.");
+      return;
+    }
+
+    broadcastStates.set(telegramId, { step: "choose_target", targetType: null });
+
+    await ctx.reply(
+      "Выбери, кому отправить рассылку:",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("👥 Всем работающим", "bc_target_all")],
+        [Markup.button.callback("🏢 По подразделению", "bc_target_dept")],
+        [Markup.button.callback("👤 Одному сотруднику", "bc_target_user")],
+        [Markup.button.callback("⛔ Отмена", "bc_cancel")],
+      ])
+    );
+  });
+
+  // === Обработчики inline-кнопок для /broadcast (поиск: РАССЫЛКА broadcast) ===
+  bot.action("bc_target_all", async (ctx) => {
+    const isAdminUser = await hasAdminAccess(ctx);
+    if (!isAdminUser) {
+      await ctx.answerCbQuery("Нет прав");
+      return;
+    }
+    const telegramId = ctx.from?.id;
+    const state = telegramId ? broadcastStates.get(telegramId) : null;
+    if (!state) {
+      await ctx.answerCbQuery("Сессия рассылки не найдена. Введите /broadcast ещё раз.");
+      return;
+    }
+    state.targetType = "all";
+    state.step = "await_text";
+    await ctx.editMessageText("Режим: всем работающим.\nОтправьте текст или фото для рассылки.");
+    await ctx.answerCbQuery();
+  });
+
+  bot.action("bc_target_dept", async (ctx) => {
+    const isAdminUser = await hasAdminAccess(ctx);
+    if (!isAdminUser) {
+      await ctx.answerCbQuery("Нет прав");
+      return;
+    }
+    const telegramId = ctx.from?.id;
+    const state = telegramId ? broadcastStates.get(telegramId) : null;
+    if (!state) {
+      await ctx.answerCbQuery("Сессия рассылки не найдена. Введите /broadcast ещё раз.");
+      return;
+    }
+    state.targetType = "department";
+    const deptIds = await getDepartmentIds();
+    if (!deptIds.length) {
+      await ctx.editMessageText(
+        "Нет ни одного подразделения в базе (поле Подразделение пусто)."
+      );
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    const buttons = deptIds.slice(0, 60).map((id) =>
+      Markup.button.callback(String(id), `bc_dept_${id}`)
+    );
+    const keyboard = [];
+    for (let i = 0; i < buttons.length; i += 3) {
+      keyboard.push(buttons.slice(i, i + 3));
+    }
+
+    state.step = "await_department";
+    await ctx.editMessageText(
+      "Режим: по подразделению.\nВыбери ID подразделения:",
+      Markup.inlineKeyboard(keyboard)
+    );
+    await ctx.answerCbQuery();
+  });
+
+  bot.action("bc_target_user", async (ctx) => {
+    const isAdminUser = await hasAdminAccess(ctx);
+    if (!isAdminUser) {
+      await ctx.answerCbQuery("Нет прав");
+      return;
+    }
+    const telegramId = ctx.from?.id;
+    const state = telegramId ? broadcastStates.get(telegramId) : null;
+    if (!state) {
+      await ctx.answerCbQuery("Сессия рассылки не найдена. Введите /broadcast ещё раз.");
+      return;
+    }
+    state.targetType = "user";
+    state.step = "await_user_search";
+    await ctx.editMessageText(
+      "Режим: одному сотруднику.\nВведи первые буквы фамилии или код VCode."
+    );
+    await ctx.answerCbQuery();
+  });
+
+  bot.action(/^bc_dept_(.+)$/, async (ctx) => {
+    const isAdminUser = await hasAdminAccess(ctx);
+    if (!isAdminUser) {
+      await ctx.answerCbQuery("Нет прав");
+      return;
+    }
+    const telegramId = ctx.from?.id;
+    const state = telegramId ? broadcastStates.get(telegramId) : null;
+    if (!state) {
+      await ctx.answerCbQuery("Сессия рассылки не найдена. Введите /broadcast ещё раз.");
+      return;
+    }
+    const deptId = parseInt(ctx.match[1], 10);
+    if (!Number.isFinite(deptId)) {
+      await ctx.answerCbQuery("Некорректный ID подразделения");
+      return;
+    }
+    state.departmentId = deptId;
+    state.step = "await_text";
+    await ctx.editMessageText(
+      `Подразделение выбрано: ${deptId}\nТеперь отправь текст или фото сообщения.`
+    );
+    await ctx.answerCbQuery();
+  });
+
+  bot.action(/^bc_user_pick_(.+)$/, async (ctx) => {
+    const isAdminUser = await hasAdminAccess(ctx);
+    if (!isAdminUser) {
+      await ctx.answerCbQuery("Нет прав");
+      return;
+    }
+    const telegramId = ctx.from?.id;
+    const state = telegramId ? broadcastStates.get(telegramId) : null;
+    if (!state) {
+      await ctx.answerCbQuery("Сессия рассылки не найдена. Введите /broadcast ещё раз.");
+      return;
+    }
+    const code = parseInt(ctx.match[1], 10);
+    if (!Number.isFinite(code)) {
+      await ctx.answerCbQuery("Некорректный код");
+      return;
+    }
+    state.targetCode = code;
+    state.step = "await_text";
+    await ctx.editMessageText(
+      `Сотрудник выбран (VCode = ${code}).\nТеперь отправь текст или фото сообщения.`
+    );
+    await ctx.answerCbQuery();
+  });
+
+  bot.action("bc_confirm", async (ctx) => {
+    const isAdminUser = await hasAdminAccess(ctx);
+    if (!isAdminUser) {
+      await ctx.answerCbQuery("Нет прав");
+      return;
+    }
+    const telegramId = ctx.from?.id;
+    const state = telegramId ? broadcastStates.get(telegramId) : null;
+    if (!state || (!state.text && !state.mediaFileId) || !state.targetType) {
+      await ctx.answerCbQuery("Сессия рассылки не найдена или неполная.");
+      return;
+    }
+
+    await ctx.answerCbQuery("Отправка...");
+
+    try {
+      let recipients = [];
+
+      if (state.targetType === "all") {
+        recipients = await lexemaCard.findMany({
+          where: {
+            terminationDate: null,
+            telegramId: { not: null },
+          },
+        });
+      } else if (state.targetType === "department") {
+        if (!state.departmentId) {
+          await ctx.reply("ID подразделения не задан. Начните с /broadcast заново.");
+          broadcastStates.delete(telegramId);
+          return;
+        }
+        recipients = await lexemaCard.findMany({
+          where: {
+            terminationDate: null,
+            telegramId: { not: null },
+            departmentId: state.departmentId,
+          },
+        });
+      } else if (state.targetType === "user") {
+        if (!state.targetCode) {
+          await ctx.reply("Код сотрудника не задан. Начните с /broadcast заново.");
+          broadcastStates.delete(telegramId);
+          return;
+        }
+        const emp = await lexemaCard.findFirst({
+          where: { code: state.targetCode, telegramId: { not: null } },
+        });
+        if (emp) recipients = [emp];
+      }
+
+      if (!recipients.length) {
+        await ctx.reply("Под подходящие условия не нашлось ни одного получателя.");
+        broadcastStates.delete(telegramId);
+        return;
+      }
+
+      let sent = 0;
+      for (const emp of recipients) {
+        if (!emp.telegramId) continue;
+        try {
+          if (state.mediaType === "photo" && state.mediaFileId) {
+            await ctx.telegram.sendPhoto(Number(emp.telegramId), state.mediaFileId, {
+              caption: state.text || undefined,
+            });
+          } else {
+            await ctx.telegram.sendMessage(Number(emp.telegramId), state.text || "");
+          }
+          sent++;
+        } catch (err) {
+          // Игнорируем индивидуальные ошибки отправки
+          continue;
+        }
+      }
+
+      await ctx.reply(`Рассылка завершена. Сообщение отправлено ${sent} получателям.`);
+    } catch (err) {
+      console.error("Ошибка при рассылке /broadcast:", err);
+      await ctx.reply("Произошла ошибка при рассылке. Попробуй позже.");
+    } finally {
+      if (telegramId) broadcastStates.delete(telegramId);
+    }
+  });
+
+  bot.action("bc_cancel", async (ctx) => {
+    const telegramId = ctx.from?.id;
+    if (telegramId) broadcastStates.delete(telegramId);
+    try {
+      await ctx.editMessageText("Рассылка отменена.");
+    } catch {
+      await ctx.reply("Рассылка отменена.");
+    }
+    await ctx.answerCbQuery();
+  });
+
   // === КОМАНДА /set_admin_log_chat: задать чат для логов (поиск: КОМАНДА /set_admin_log_chat) ===
   bot.command("set_admin_log_chat", async (ctx) => {
     if (!isOwner(ctx)) {
@@ -473,11 +856,40 @@ export function createBot() {
     await ctx.reply(`Admin log chat установлен: ${chatId}`);
   });
 
-  // Обработка /news с фото в подписи
+  // Обработка /news с фото в подписи + ввод фото для /broadcast
   bot.on("photo", async (ctx) => {
     const caption = ctx.message?.caption || "";
-    if (!/^\/news(@\w+)?\b/i.test(caption)) return;
+    if (/^\/news(@\w+)?\b/i.test(caption)) {
     await handleNewsCommand(ctx);
+      return;
+    }
+
+    if (!isPrivate(ctx)) return;
+    const telegramId = ctx.from?.id;
+    if (!telegramId) return;
+
+    const state = broadcastStates.get(telegramId);
+    if (!state || state.step !== "await_text") return;
+
+    const isAdminUser = await hasAdminAccess(ctx);
+    if (!isAdminUser) return;
+
+    const photos = ctx.message?.photo;
+    if (!Array.isArray(photos) || photos.length === 0) return;
+
+    const fileId = photos[photos.length - 1].file_id;
+    state.mediaType = "photo";
+    state.mediaFileId = fileId;
+    state.text = caption?.trim() ? caption.trim() : null;
+    state.step = "confirm";
+
+    await ctx.reply(
+      buildBroadcastPreview(state),
+      Markup.inlineKeyboard([
+        [Markup.button.callback("✅ Отправить", "bc_confirm")],
+        [Markup.button.callback("⛔ Отмена", "bc_cancel")],
+      ])
+    );
   });
 
   // Подтверждение/блокировка сессии при попытке входа под чужим Telegram
@@ -988,6 +1400,79 @@ export function createBot() {
     }
 
     const text = ctx.message.text.trim();
+
+    // === /broadcast: обработка текста по состоянию рассылки ===
+    const bcState = broadcastStates.get(telegramId);
+    if (bcState) {
+      const isAdminUser = await hasAdminAccess(ctx);
+      if (!isAdminUser) {
+        broadcastStates.delete(telegramId);
+      } else if (bcState.step === "await_user_search") {
+        const query = text.trim();
+        if (!query) {
+          await ctx.reply("Введи первые буквы фамилии (минимум 3) или код VCode.");
+          return;
+        }
+
+        // Требуем минимум 3 буквы для поиска по фамилии
+        if (!/^\d+$/.test(query) && query.length < 3) {
+          await ctx.reply("Введи минимум 3 первых буквы фамилии или код VCode.");
+          return;
+        }
+
+        // Поиск по коду
+        if (/^\d+$/.test(query)) {
+          const code = parseInt(query, 10);
+          bcState.targetCode = code;
+          bcState.step = "await_text";
+          await ctx.reply(
+            `Сотрудник выбран (VCode = ${code}).\nТеперь отправь текст или фото сообщения.`
+          );
+          return;
+        }
+
+        // Поиск по фамилии: только по началу (prefix), без contains
+        const found = await lexemaCard.findMany({
+          where: {
+            terminationDate: null,
+            telegramId: { not: null },
+            lastName: { startsWith: query },
+          },
+          take: 10,
+          orderBy: { code: "asc" },
+        });
+
+        if (!found.length) {
+          await ctx.reply("Никого не нашли. Попробуй другое имя/часть фамилии или код VCode.");
+          return;
+        }
+
+        const buttons = found.map((e) => {
+          const label = `${e.lastName || ""} ${e.firstName || ""} (${e.code})`.trim();
+          return [Markup.button.callback(label.slice(0, 64), `bc_user_pick_${e.code}`)];
+        });
+        await ctx.reply(
+          "Выбери сотрудника из списка:",
+          Markup.inlineKeyboard([...buttons, [Markup.button.callback("⛔ Отмена", "bc_cancel")]])
+        );
+        return;
+      } else if (bcState.step === "await_text") {
+        bcState.text = text;
+        bcState.mediaType = null;
+        bcState.mediaFileId = null;
+        bcState.step = "confirm";
+
+        await ctx.reply(
+          buildBroadcastPreview(bcState),
+          Markup.inlineKeyboard([
+            [Markup.button.callback("✅ Отправить", "bc_confirm")],
+            [Markup.button.callback("⛔ Отмена", "bc_cancel")],
+          ])
+        );
+        return;
+      }
+      // Если broadcast активен, но шаг другой — продолжаем обычную логику регистрации
+    }
     
     // Проверяем, есть ли у пользователя активное состояние заполнения
     const userState = userStates.get(telegramId);
@@ -1023,30 +1508,24 @@ export function createBot() {
 
         case "waiting_middleName":
           userState.data.middleName = text.trim() === "-" ? null : text.trim();
-          userState.step = "waiting_departmentId";
-          await ctx.reply("4. Подразделение (ID - число)");
+          userState.step = "waiting_tabNumber";
+          await ctx.reply(
+            "4. Табельный номер (смотрите на пропуске).\nПример: №11111 или №1111"
+          );
           break;
 
-        case "waiting_departmentId":
-          const departmentId = parseInt(text.trim());
-          if (isNaN(departmentId)) {
-            await ctx.reply("Пожалуйста, введите корректный ID подразделения (число).");
+        case "waiting_tabNumber":
+          // Принимаем форматы с № и без, вытаскиваем цифры
+          const tabDigits = text.replace(/\D/g, "");
+          if (!tabDigits || isNaN(Number(tabDigits))) {
+            await ctx.reply(
+              'Пожалуйста, введите корректный табельный номер.\nПример: №11111 или №1111'
+            );
             return;
           }
-          userState.data.departmentId = departmentId;
-          userState.step = "waiting_positionId";
-          await ctx.reply("5. Должность (ID - число)");
-          break;
-
-        case "waiting_positionId":
-          const positionId = parseInt(text.trim());
-          if (isNaN(positionId)) {
-            await ctx.reply("Пожалуйста, введите корректный ID должности (число).");
-            return;
-          }
-          userState.data.positionId = positionId;
+          userState.data.tabNumber = tabDigits;
           userState.step = "waiting_phone";
-          await ctx.reply("6. Номер телефона");
+          await ctx.reply("5. Номер телефона");
           break;
 
         case "waiting_phone":
@@ -1094,24 +1573,15 @@ export function createBot() {
           userState.step = "confirming_data";
           break;
 
-        case "editing_positionId":
-          const editPositionId = parseInt(text.trim());
-          if (isNaN(editPositionId)) {
-            await ctx.reply("Пожалуйста, введите корректный ID должности (число).");
+        case "editing_tabNumber":
+          const editTabDigits = text.replace(/\D/g, "");
+          if (!editTabDigits || isNaN(Number(editTabDigits))) {
+            await ctx.reply(
+              'Пожалуйста, введите корректный табельный номер.\nПример: №11111 или №1111'
+            );
             return;
           }
-          userState.data.positionId = editPositionId;
-          await showDataConfirmation(ctx, userState.data);
-          userState.step = "confirming_data";
-          break;
-
-        case "editing_departmentId":
-          const editDepartmentId = parseInt(text.trim());
-          if (isNaN(editDepartmentId)) {
-            await ctx.reply("Пожалуйста, введите корректный ID подразделения (число).");
-            return;
-          }
-          userState.data.departmentId = editDepartmentId;
+          userState.data.tabNumber = editTabDigits;
           await showDataConfirmation(ctx, userState.data);
           userState.step = "confirming_data";
           break;
@@ -1230,8 +1700,7 @@ async function showDataConfirmation(ctx, data) {
     `👤 Фамилия: ${data.lastName || "не указано"}\n` +
     `👤 Имя: ${data.firstName || "не указано"}\n` +
     `👤 Отчество: ${data.middleName || "не указано"}\n` +
-    `🏢 Подразделение (ID): ${data.departmentId || "не указано"}\n` +
-    `💼 Должность (ID): ${data.positionId || "не указано"}\n` +
+    `🆔 Табельный номер: ${data.tabNumber || "не указано"}\n` +
     `📞 Телефон: ${formattedPhone}`;
 
   const keyboard = Markup.inlineKeyboard([
@@ -1251,10 +1720,9 @@ async function showEditMenu(ctx) {
     ],
     [
       Markup.button.callback("👤 Отчество", "change_middleName"),
-      Markup.button.callback("🏢 Подразделение", "change_departmentId"),
+      Markup.button.callback("🆔 Табельный номер", "change_tabNumber"),
     ],
     [
-      Markup.button.callback("💼 Должность", "change_positionId"),
       Markup.button.callback("📞 Телефон", "change_phone"),
     ],
   ]);
@@ -1283,13 +1751,9 @@ async function handleFieldChange(ctx, field, userState) {
       step = "editing_middleName";
       prompt = "Введите новое отчество (если нет, введите \"-\"):";
       break;
-    case "positionId":
-      step = "editing_positionId";
-      prompt = "Введите новый ID должности (число):";
-      break;
-    case "departmentId":
-      step = "editing_departmentId";
-      prompt = "Введите новый ID подразделения (число):";
+    case "tabNumber":
+      step = "editing_tabNumber";
+      prompt = 'Введите новый табельный номер (как на пропуске). Пример: №11111 или №1111';
       break;
     case "phone":
       step = "editing_phone";
@@ -1518,7 +1982,16 @@ async function logAdminAction(ctx, entry) {
     try {
       await ctx.telegram.sendMessage(dest, lines);
     } catch (err) {
-      console.error("Failed to send admin log message", err);
+      // Обрабатываем разные типы ошибок более аккуратно
+      const errorDesc = err.response?.description || err.message || "Unknown error";
+      
+      if (errorDesc.includes("chat not found") || errorDesc.includes("chat_id is empty")) {
+        // Чат не найден или бот удален из чата - это нормальная ситуация, просто логируем без stack trace
+        console.log(`Admin log chat not accessible (chat_id: ${dest}). Update admin log chat with /set_admin_log_chat`);
+      } else {
+        // Другие ошибки - логируем полностью
+        console.error("Failed to send admin log message:", errorDesc);
+      }
     }
   }
 }
@@ -1533,8 +2006,8 @@ async function handleVerificationAndLink(ctx, form) {
     lastName: form.lastName,
     firstName: form.firstName,
     middleName: form.middleName,
-    positionId: form.positionId,
-    departmentId: form.departmentId,
+    // Используем табельный номер вместо должности/подразделения
+    tabNumber: form.tabNumber,
     phoneNumber: form.phoneNumber,
   });
 
@@ -1846,51 +2319,60 @@ async function handleVerificationAndLink(ctx, form) {
     // Не прерываем регистрацию, если не удалось создать ссылку
   }
 
-  // Сообщение об успешной регистрации с ссылкой на общедоступный канал
+  // Сообщение об успешной регистрации с ссылками на каналы
   const publicChannelLink = "https://t.me/salstek";
-  let reply = "Регистрация успешно завершена! Твои данные сохранены.\n\n";
-  reply += `📢 Общедоступный канал:\n${publicChannelLink}`;
+  let reply =
+    "Регистрация успешно завершена! Твои данные сохранены.\n\n" +
+    "Приглашаем тебя в наши каналы, чтобы быть в курсе всех новостей:\n\n";
   
-  // Добавляем инвайт-ссылку на новостной канал, если она была создана
-  if (newsInvite) {
-    const newsExpiresAtText = formatISO9075(newsInvite.expiresAt);
-    reply += `\n\n📰 Новостной(внутренний) канал:\n${newsInvite.url}\nДействует до: ${newsExpiresAtText}`;
-  } else {
-    // Если ссылка не была создана, пытаемся показать публичную ссылку или ID
-    try {
-      const newsChannelId = await getNewsChannelId();
-      if (newsChannelId) {
-        let newsChannelLink = newsChannelId;
-        if (newsChannelId.startsWith("@")) {
-          newsChannelLink = `https://t.me/${newsChannelId.slice(1)}`;
-        } else if (newsChannelId.startsWith("-")) {
-          // Для числовых ID каналов пытаемся получить username через API
-          try {
-            const chatInfo = await ctx.telegram.getChat(newsChannelId);
-            if (chatInfo?.username) {
-              newsChannelLink = `https://t.me/${chatInfo.username}`;
-            } else {
-              // Если username нет, показываем, что это приватный канал
-              newsChannelLink = `Приватный канал (ID: ${newsChannelId})`;
-            }
-          } catch (chatErr) {
-            // Если не удалось получить информацию, показываем ID
-            newsChannelLink = `Канал (ID: ${newsChannelId})`;
-          }
-        } else {
-          // Если это просто username без @
-          newsChannelLink = `https://t.me/${newsChannelId}`;
-        }
-        reply += `\n\n📰 Новостной(внутренний) канал: ${newsChannelLink}`;
-      }
-    } catch (err) {
-      console.error("Failed to get news channel ID", err);
-    }
-  }
+  // 1. Общедоступный канал
+  reply += `1. 📢 Общедоступный канал:\n${publicChannelLink}\n\n`;
 
-  if (newsInvite) {
+  // 2. Внутренний информационный канал сотрудников
+  // ЗАКОММЕНТИРОВАНО: временно отключено
+  // Добавляем инвайт-ссылку на новостной канал, если она была создана
+  // if (newsInvite) {
+  //   const newsExpiresAtText = formatISO9075(newsInvite.expiresAt);
+  //   reply +=
+  //     `2. 📰 Внутренний информационный канал сотрудников - В команде | «Салаватстекло»\n` +
+  //     `${newsInvite.url}\n\n` +
+  //     `Действует до: ${newsExpiresAtText}`;
+  // } else {
+  //   // Если ссылка не была создана, пытаемся показать публичную ссылку или ID
+  //   try {
+  //     const newsChannelId = await getNewsChannelId();
+  //     if (newsChannelId) {
+  //       let newsChannelLink = newsChannelId;
+  //       if (newsChannelId.startsWith("@")) {
+  //         newsChannelLink = `https://t.me/${newsChannelId.slice(1)}`;
+  //       } else if (newsChannelId.startsWith("-")) {
+  //         // Для числовых ID каналов пытаемся получить username через API
+  //         try {
+  //           const chatInfo = await ctx.telegram.getChat(newsChannelId);
+  //           if (chatInfo?.username) {
+  //             newsChannelLink = `https://t.me/${chatInfo.username}`;
+  //           } else {
+  //             // Если username нет, показываем, что это приватный канал
+  //             newsChannelLink = `Приватный канал (ID: ${newsChannelId})`;
+  //           }
+  //         } catch (chatErr) {
+  //           // Если не удалось получить информацию, показываем ID
+  //           newsChannelLink = `Канал (ID: ${newsChannelId})`;
+  //         }
+  //       } else {
+  //         // Если это просто username без @
+  //         newsChannelLink = `https://t.me/${newsChannelId}`;
+  //       }
+  //       reply +=
+  //         `2. 📰 Внутренний информационный канал сотрудников - В команде | «Салаватстекло»\n` +
+  //         `${newsChannelLink}`;
+  //     }
+  //   } catch (err) {
+  //     console.error("Failed to get news channel ID", err);
+  //   }
+  // }
+
   reply += `\n\nЕсли ссылка истечет или будет использована — запусти /start ещё раз.`;
-  }
 
   await ctx.reply(reply);
 }
@@ -1906,5 +2388,40 @@ async function resolveChannelId(department) {
     return config.channelId; // fallback
   }
   throw new Error("CHANNEL_ID is not configured for this department");
+}
+
+async function getDepartmentIds() {
+  // Берём только заполненные departmentId у работающих сотрудников
+  const rows = await lexemaCard.findMany({
+    where: {
+      terminationDate: null,
+      departmentId: { not: null },
+    },
+    distinct: ["departmentId"],
+    select: { departmentId: true },
+    orderBy: { departmentId: "asc" },
+    take: 500,
+  });
+
+  return rows
+    .map((r) => r.departmentId)
+    .filter((x) => Number.isFinite(x))
+    .sort((a, b) => a - b);
+}
+
+function buildBroadcastPreview(state) {
+  const target =
+    state.targetType === "all"
+      ? "всем работающим"
+      : state.targetType === "department"
+      ? `подразделению ${state.departmentId ?? "—"}`
+      : state.targetType === "user"
+      ? `сотруднику VCode=${state.targetCode ?? "—"}`
+      : "—";
+
+  const kind = state.mediaType === "photo" ? "Фото" : "Текст";
+  const text = state.text ? state.text : "—";
+
+  return `Подтверди рассылку:\n\nКому: ${target}\nТип: ${kind}\n\nСообщение:\n${text}`;
 }
 

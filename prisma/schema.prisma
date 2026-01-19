@@ -22,8 +22,7 @@ model LexemaCard {
   lastName          String?   @map("Фамилия") // Фамилия
   firstName         String?   @map("Имя") // Имя
   middleName        String?   @map("Отчество") // Отчество
-  departmentId      Int?      @map("Подразделение") // Подразделение / DepartmentId
-  positionId        Int?      @map("Должность") // Должность / PositionId
+  tabNumber         String?   @map("ТабельныйНомер") // Табельный номер (как на пропуске)
   terminationDate   DateTime? @map("ДатаУвольнения") // ДатаУвольнения / TerminationDate
   phone             String?   @map("Сотовый") // Сотовый / Phone
   telegramUsername  String?   @map("ТелеграмЮзернейм") // ТелеграмЮзернейм / TelegramUsername

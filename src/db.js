@@ -74,8 +74,7 @@ function transformRow(row) {
     lastName: row.lastName || row.Фамилия || null,
     firstName: row.firstName || row.Имя || null,
     middleName: row.middleName || row.Отчество || null,
-    departmentId: row.departmentId !== undefined ? row.departmentId : (row.Подразделение !== undefined ? row.Подразделение : null),
-    positionId: row.positionId !== undefined ? row.positionId : (row.Должность !== undefined ? row.Должность : null),
+    tabNumber: row.tabNumber !== undefined ? row.tabNumber : (row.ТабельныйНомер !== undefined ? String(row.ТабельныйНомер) : null),
     terminationDate: row.terminationDate || row.ДатаУвольнения || null,
     phone: row.phone || row.Сотовый || null,
     telegramUsername: row.telegramUsername || row.ТелеграмЮзернейм || null,
@@ -123,6 +122,9 @@ function buildWhereClause(where) {
         } else {
           conditions.push(`[${columnName}] <> ${value.not}`);
         }
+      } else if (value.startsWith !== undefined) {
+        const searchValue = value.startsWith.replace(/'/g, "''");
+        conditions.push(`[${columnName}] LIKE N'${searchValue}%'`);
       } else if (value.contains !== undefined) {
         const searchValue = value.contains.replace(/'/g, "''");
         conditions.push(`[${columnName}] LIKE N'%${searchValue}%'`);
@@ -162,8 +164,7 @@ function getColumnName(prismaField) {
     lastName: 'Фамилия',
     firstName: 'Имя',
     middleName: 'Отчество',
-    departmentId: 'Подразделение',
-    positionId: 'Должность',
+    tabNumber: 'ТабельныйНомер',
     terminationDate: 'ДатаУвольнения',
     phone: 'Сотовый',
     telegramUsername: 'ТелеграмЮзернейм',
@@ -186,8 +187,7 @@ export const lexemaCard = {
         Фамилия as lastName,
         Имя as firstName,
         Отчество as middleName,
-        Подразделение as departmentId,
-        Должность as positionId,
+        ТабельныйНомер as tabNumber,
         ДатаУвольнения as terminationDate,
         Сотовый as phone,
         ТелеграмЮзернейм as telegramUsername,
@@ -241,8 +241,7 @@ export const lexemaCard = {
         Фамилия as lastName,
         Имя as firstName,
         Отчество as middleName,
-        Подразделение as departmentId,
-        Должность as positionId,
+        ТабельныйНомер as tabNumber,
         ДатаУвольнения as terminationDate,
         Сотовый as phone,
         ТелеграмЮзернейм as telegramUsername,

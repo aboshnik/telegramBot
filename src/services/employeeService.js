@@ -1,6 +1,6 @@
 import { lexemaCard } from '../db.js';
 
-export async function findEmployee(prisma, { lastName, firstName, middleName, positionId, departmentId, phoneNumber }) {
+export async function findEmployee(prisma, { lastName, firstName, middleName, tabNumber, phoneNumber }) {
   const norm = (s) => (s || "").trim();
   const onlyDigits = (s) => String(s || "").replace(/\D/g, "");
 
@@ -16,14 +16,8 @@ export async function findEmployee(prisma, { lastName, firstName, middleName, po
   if (middleName) {
     where.middleName = { contains: norm(middleName) };
   }
-  if (positionId !== null && positionId !== undefined) {
-    where.positionId = parseInt(positionId);
-  }
-  if (departmentId !== null && departmentId !== undefined) {
-    where.departmentId = parseInt(departmentId);
-  }
 
-  // Ищем кандидатов по ФИО, должности и подразделению
+  // Ищем кандидатов по ФИО
   let candidates = await lexemaCard.findMany({
     where,
   });
@@ -43,7 +37,61 @@ export async function findEmployee(prisma, { lastName, firstName, middleName, po
 
   if (!filtered.length) return null;
 
-  // Если передан телефон — сверяем цифры
+  // Если передан табельный номер — сверяем цифры
+  if (tabNumber) {
+    const userTabDigits = onlyDigits(tabNumber);
+    const byTabNumber = filtered.find((c) => {
+      if (!c.tabNumber) return false;
+      const dbTabDigits = onlyDigits(String(c.tabNumber));
+      // Сравниваем табельные номера по цифрам
+      return userTabDigits === dbTabDigits;
+    });
+
+    if (!byTabNumber) return null;
+    
+    // Если передан телефон — дополнительно сверяем телефон
+    if (phoneNumber) {
+      const userDigits = onlyDigits(phoneNumber);
+      if (!byTabNumber.phone) return null;
+      const dbDigits = onlyDigits(byTabNumber.phone);
+
+      // Нормализуем оба номера к единому формату: 10 цифр, начинающихся с 9
+      const normalizeForCompare = (digits) => {
+        // Если номер начинается с 7 (11 цифр): убираем первую 7
+        if (digits.length === 11 && digits.startsWith("7")) {
+          return digits.slice(1);
+        }
+        // Если номер начинается с 8 (11 цифр): убираем первую 8
+        if (digits.length === 11 && digits.startsWith("8")) {
+          return digits.slice(1);
+        }
+        // Если номер 10 цифр и начинается с 8: убираем первую 8, добавляем 9
+        if (digits.length === 10 && digits.startsWith("8")) {
+          return "9" + digits.slice(1);
+        }
+        // Если номер 9 цифр: добавляем 9 в начало
+        if (digits.length === 9) {
+          return "9" + digits;
+        }
+        // Если номер 10 цифр и начинается с 9: оставляем как есть
+        if (digits.length === 10 && digits.startsWith("9")) {
+          return digits;
+        }
+        // Возвращаем как есть
+        return digits;
+      };
+
+      const userNorm = normalizeForCompare(userDigits);
+      const dbNorm = normalizeForCompare(dbDigits);
+      
+      // Сравниваем нормализованные номера
+      return userNorm === dbNorm ? byTabNumber : null;
+    }
+
+    return byTabNumber;
+  }
+
+  // Если табельного номера нет, но передан телефон — сверяем телефон
   if (phoneNumber) {
     const userDigits = onlyDigits(phoneNumber);
     const byPhone = filtered.find((c) => {
@@ -86,7 +134,7 @@ export async function findEmployee(prisma, { lastName, firstName, middleName, po
     return byPhone || null;
   }
 
-  // Если телефона нет — берём первого кандидата
+  // Если ни табельного номера, ни телефона нет — берём первого кандидата
   return filtered[0] || null;
 }
 
