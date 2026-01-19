@@ -2366,6 +2366,7 @@ async function handleVerificationAndLink(ctx, form) {
   // }
 
   reply += `\n\nЕсли ссылка истечет или будет использована — запусти /start ещё раз.`;
+  await ctx.reply("Вся нужная информация для новых сотрудников и общение - @InfoStelkoBot");
 
   await ctx.reply(reply);
 }
